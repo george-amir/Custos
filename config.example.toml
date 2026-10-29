@@ -1,0 +1,49 @@
+# JevSec v0.1 Example Configuration
+
+[daemon]
+bouncer_listen = "127.0.0.1:8085"
+decisions_file = "decisions.jsonl"
+default_ban_ttl_secs = 3600
+
+[[logs]]
+path = "tests/fixtures/sample_access.log"
+format = "nginx_combined"
+
+[window]
+# Sliding behavioral window duration in seconds per IP
+window_secs = 15
+# Flush check interval in milliseconds
+flush_interval_ms = 2500
+# L1 instant-ban volumetric flood threshold within a single window
+l1_flood_threshold = 120
+# Minimum requests or suspicion score required to promote an IP window to Jev L2 analysis
+min_suspicion_score = 2
+# Maximum sample requests retained per IP window for Jev state compaction
+max_sample_requests = 10
+
+[jev]
+endpoint = "https://api.typesafe.ai/v1/systemone"
+model = "jev-latest"
+# Can also be set via TYPESAFE_API_KEY environment variable
+api_key = ""
+# Maximum suspicious IP actors packed into a single Jev /v1/systemone request
+max_actors_per_batch = 25
+# Minimum calibrated noul probability (0.0 - 1.0) required to issue a ban
+noul_ban_threshold = 0.80
+# Minimum choice confidence (0.0 - 1.0) required to accept threat classification
+choice_confidence_threshold = 0.70
+# Minimum confidence to cache an attack signature for L1 zero-token blocking
+auto_signature_confidence_threshold = 0.92
+# HTTP request timeout in milliseconds
+timeout_ms = 5000
+
+[firewall]
+# Enable OS-level packet filtering bouncer alongside the HTTP Bouncer API
+enabled = true
+# Cross-platform backend: "auto" | "nftables" | "ipset" | "pf" | "windows_netsh"
+# ("auto" selects nftables on Linux, pf on macOS/BSD, and windows_netsh on Windows)
+backend = "auto"
+# When true, records & logs the exact OS firewall commands without requiring root/sudo.
+# Set to false (or pass --firewall-live) when running with root/Administrator privileges.
+dry_run = true
+table_name = "jevsec_block"
