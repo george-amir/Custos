@@ -228,26 +228,52 @@ impl JevBatchAnalyzer {
             "Sending batch evaluation request to TypeSafe Jev"
         );
 
-        let response = self
-            .http
-            .post(&self.cfg.endpoint)
-            .bearer_auth(&self.cfg.api_key)
-            .json(req)
-            .send()
-            .await
-            .context("HTTP request to TypeSafe Jev /v1/systemone failed")?;
+        let max_attempts = 3usize;
+        let mut last_err = None;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("TypeSafe Jev API returned HTTP {status}: {body}");
+        for attempt in 1..=max_attempts {
+            let send_res = self
+                .http
+                .post(&self.cfg.endpoint)
+                .bearer_auth(&self.cfg.api_key)
+                .json(req)
+                .send()
+                .await;
+
+            match send_res {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let parsed: JevSystemOneResponse = response
+                            .json()
+                            .await
+                            .context("Failed to deserialize JevSystemOneResponse JSON")?;
+                        return Ok(parsed);
+                    }
+                    let body = response.text().await.unwrap_or_default();
+                    if (status.as_u16() == 429 || status.is_server_error())
+                        && attempt < max_attempts
+                    {
+                        tokio::time::sleep(Duration::from_millis(150 * (attempt as u64))).await;
+                        last_err = Some(anyhow::anyhow!(
+                            "TypeSafe Jev API returned transient HTTP {status}: {body}"
+                        ));
+                        continue;
+                    }
+                    bail!("TypeSafe Jev API returned HTTP {status}: {body}");
+                }
+                Err(err) => {
+                    if attempt < max_attempts {
+                        tokio::time::sleep(Duration::from_millis(150 * (attempt as u64))).await;
+                        last_err = Some(anyhow::Error::new(err));
+                        continue;
+                    }
+                    return Err(err).context("HTTP request to TypeSafe Jev /v1/systemone failed");
+                }
+            }
         }
 
-        let parsed: JevSystemOneResponse = response
-            .json()
-            .await
-            .context("Failed to deserialize JevSystemOneResponse JSON")?;
-        Ok(parsed)
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Jev request failed after retries")))
     }
 
     fn extract_verdicts(
@@ -447,7 +473,10 @@ mod tests {
         let req = analyzer.build_batch_request(&[summary]);
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(serialized["model"], "jev-latest");
-        assert_eq!(serialized["questions"]["actor_0_should_ban"]["type"], "noul");
+        assert_eq!(
+            serialized["questions"]["actor_0_should_ban"]["type"],
+            "noul"
+        );
         assert_eq!(
             serialized["questions"]["actor_0_threat_class"]["type"],
             "choice"

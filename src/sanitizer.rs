@@ -61,7 +61,10 @@ pub fn sanitize_untrusted(raw: &str, max_len: usize) -> SanitizedField {
     }
 
     let text = if prompt_injection_suspected {
-        format!("[REDACTED_INJECTION_ATTEMPT:{}]", truncate_chars(&cleaned, 48))
+        format!(
+            "[REDACTED_INJECTION_ATTEMPT:{}]",
+            truncate_chars(&cleaned, 48)
+        )
     } else {
         cleaned.trim().to_string()
     };

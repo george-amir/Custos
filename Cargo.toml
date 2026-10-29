@@ -1,9 +1,18 @@
 [package]
-name = "jevsec"
+name = "custos"
 version = "0.1.0"
 edition = "2024"
-description = "Open-source behavioral security engine & log analyzer powered by TypeSafe AI's Jev model"
+description = "Custos — Open-source behavioral security engine, bouncer, and gRPC threat-intelligence hub powered by TypeSafe AI's Jev model"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/george-amir/custos"
+homepage = "https://github.com/george-amir/custos"
+readme = "README.md"
+keywords = ["security", "waf", "crowdsec", "firewall", "jev"]
+categories = ["network-programming", "web-programming", "command-line-utilities"]
+
+[[bin]]
+name = "custos"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -11,13 +20,16 @@ axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 dashmap = "6.1"
+prost = "0.13"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
 toml = "0.8"
+tonic = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

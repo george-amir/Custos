@@ -92,6 +92,7 @@ pub fn build_bouncer_router(state: AppState) -> Router {
         .route("/v1/decisions/{ip}", delete(handle_delete_decision))
         .route("/v1/firewall", get(handle_firewall_status))
         .route("/v1/stats", get(handle_stats))
+        .route("/metrics", get(handle_prometheus_metrics))
         .with_state(state)
 }
 
@@ -149,6 +150,7 @@ async fn handle_bouncer_check(
     if let Some(decision) = state.store.check_ip(&ip) {
         let mut resp_headers = HeaderMap::new();
         if let Ok(val) = HeaderValue::from_str(&decision.threat_class) {
+            resp_headers.insert("x-custos-threat", val.clone());
             resp_headers.insert("x-jevsec-threat", val);
         }
         (
@@ -257,7 +259,11 @@ async fn handle_stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let estimated_cost_usd = (input_tokens as f64 / 1_000_000.0) * 0.042;
 
     Json(StatsResponse {
-        events_processed: state.window.metrics.events_processed.load(Ordering::Relaxed),
+        events_processed: state
+            .window
+            .metrics
+            .events_processed
+            .load(Ordering::Relaxed),
         static_ignored: state.window.metrics.static_ignored.load(Ordering::Relaxed),
         l1_instant_bans: state.window.metrics.l1_instant_bans.load(Ordering::Relaxed),
         windows_promoted_to_jev: state
@@ -278,4 +284,78 @@ async fn handle_stats(State(state): State<AppState>) -> Json<StatsResponse> {
         firewall_rules_applied: state.firewall.metrics.rules_applied.load(Ordering::Relaxed),
         firewall_rules_removed: state.firewall.metrics.rules_removed.load(Ordering::Relaxed),
     })
+}
+
+/// Prometheus OpenMetrics exposition endpoint (`GET /metrics`).
+async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let events = state
+        .window
+        .metrics
+        .events_processed
+        .load(Ordering::Relaxed);
+    let static_ignored = state.window.metrics.static_ignored.load(Ordering::Relaxed);
+    let l1_bans = state.window.metrics.l1_instant_bans.load(Ordering::Relaxed);
+    let promoted = state
+        .window
+        .metrics
+        .windows_promoted_to_jev
+        .load(Ordering::Relaxed);
+    let batches = state.jev.metrics.batches_evaluated.load(Ordering::Relaxed);
+    let actors = state.jev.metrics.actors_evaluated.load(Ordering::Relaxed);
+    let in_tokens = state.jev.metrics.input_tokens_total.load(Ordering::Relaxed);
+    let active_bans = state.store.active_count();
+    let signatures = state.window.active_signature_count();
+    let fw_applied = state.firewall.metrics.rules_applied.load(Ordering::Relaxed);
+    let fw_removed = state.firewall.metrics.rules_removed.load(Ordering::Relaxed);
+    let fw_errors = state
+        .firewall
+        .metrics
+        .command_errors
+        .load(Ordering::Relaxed);
+
+    let body = format!(
+        "# HELP custos_events_processed_total Total HTTP access log events ingested.\n\
+         # TYPE custos_events_processed_total counter\n\
+         custos_events_processed_total {events}\n\
+         # HELP custos_static_ignored_total Total benign static asset requests ignored at L1.\n\
+         # TYPE custos_static_ignored_total counter\n\
+         custos_static_ignored_total {static_ignored}\n\
+         # HELP custos_l1_instant_bans_total Instant bans triggered by L1 flood or auto-signature cache.\n\
+         # TYPE custos_l1_instant_bans_total counter\n\
+         custos_l1_instant_bans_total {l1_bans}\n\
+         # HELP custos_windows_promoted_total Suspicious IP windows promoted to TypeSafe Jev L2.\n\
+         # TYPE custos_windows_promoted_total counter\n\
+         custos_windows_promoted_total {promoted}\n\
+         # HELP custos_jev_batches_total Total multi-actor batch requests sent to TypeSafe Jev /v1/systemone.\n\
+         # TYPE custos_jev_batches_total counter\n\
+         custos_jev_batches_total {batches}\n\
+         # HELP custos_jev_actors_evaluated_total Total suspicious actors evaluated by Jev.\n\
+         # TYPE custos_jev_actors_evaluated_total counter\n\
+         custos_jev_actors_evaluated_total {actors}\n\
+         # HELP custos_jev_input_tokens_total Total Jev input tokens consumed.\n\
+         # TYPE custos_jev_input_tokens_total counter\n\
+         custos_jev_input_tokens_total {in_tokens}\n\
+         # HELP custos_active_bans Current active IP bans in DecisionStore.\n\
+         # TYPE custos_active_bans gauge\n\
+         custos_active_bans {active_bans}\n\
+         # HELP custos_auto_cached_signatures Current zero-day L1 signatures cached in memory.\n\
+         # TYPE custos_auto_cached_signatures gauge\n\
+         custos_auto_cached_signatures {signatures}\n\
+         # HELP custos_firewall_rules_applied_total Total OS kernel firewall rules applied.\n\
+         # TYPE custos_firewall_rules_applied_total counter\n\
+         custos_firewall_rules_applied_total {fw_applied}\n\
+         # HELP custos_firewall_rules_removed_total Total OS kernel firewall rules removed.\n\
+         # TYPE custos_firewall_rules_removed_total counter\n\
+         custos_firewall_rules_removed_total {fw_removed}\n\
+         # HELP custos_firewall_command_errors_total Total OS firewall execution errors.\n\
+         # TYPE custos_firewall_command_errors_total counter\n\
+         custos_firewall_command_errors_total {fw_errors}\n"
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, body)
 }

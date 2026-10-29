@@ -15,6 +15,7 @@ pub enum DecisionSource {
     L1Deterministic,
     L1AutoSignature,
     JevSystemOne,
+    HubCommunity,
     ManualAdmin,
 }
 
@@ -154,6 +155,48 @@ impl DecisionStore {
 
     pub fn active_count(&self) -> usize {
         self.list_active().len()
+    }
+
+    /// Sweeps and evicts all expired bans from memory, returning the list of expired IPs
+    /// so the daemon can remove them from `pf`/`netsh` OS firewall tables.
+    pub fn sweep_expired(&self) -> Vec<IpAddr> {
+        let now = Utc::now();
+        let expired: Vec<IpAddr> = self
+            .active_bans
+            .iter()
+            .filter(|e| e.value().is_expired(now))
+            .map(|e| *e.key())
+            .collect();
+        for ip in &expired {
+            self.active_bans.remove(ip);
+        }
+        expired
+    }
+
+    /// Compacts `decisions.jsonl` on disk so it only contains currently active, non-expired decisions.
+    pub fn compact_persistence_file(&self) -> Result<()> {
+        let active = self.list_active();
+        if let Some(parent) = self.persistence_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.persistence_path)
+            .with_context(|| {
+                format!(
+                    "Failed to compact decisions file {}",
+                    self.persistence_path.display()
+                )
+            })?;
+        for decision in &active {
+            let serialized = serde_json::to_string(decision)?;
+            writeln!(file, "{serialized}")?;
+        }
+        Ok(())
     }
 
     fn append_to_disk(&self, decision: &BanDecision) -> Result<()> {

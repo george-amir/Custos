@@ -1,0 +1,81 @@
+syntax = "proto3";
+package custos.hub.v1;
+
+enum ThreatClassProto {
+  THREAT_CLASS_UNSPECIFIED = 0;
+  BENIGN_TRAFFIC = 1;
+  CREDENTIAL_STUFFING = 2;
+  SQLI_OR_INJECTION = 3;
+  PATH_TRAVERSAL_LFI = 4;
+  VULNERABILITY_SCANNER = 5;
+  API_ENUMERATION_IDOR = 6;
+  LAYER7_DOS = 7;
+}
+
+message IpSignal {
+  bytes ip = 1;                   // 4 bytes (IPv4) or 16 bytes (IPv6)
+  ThreatClassProto threat = 2;    // 1 byte varint
+  float noul = 3;                 // 4 bytes
+  float confidence = 4;           // 4 bytes
+  uint32 suggested_ttl_secs = 5;
+}
+
+message SignatureSignal {
+  string method = 1;
+  string path_prefix = 2;
+  ThreatClassProto threat = 3;
+  float confidence = 4;
+}
+
+message SignalBatch {
+  string node_id = 1;
+  string api_token = 2;
+  repeated IpSignal ip_signals = 3;
+  repeated SignatureSignal signature_signals = 4;
+}
+
+message PushAck {
+  uint32 accepted_ips = 1;
+  uint32 accepted_signatures = 2;
+  uint32 rejected_canary = 3;
+  uint64 latest_seq = 4;
+}
+
+message PullRequest {
+  string node_id = 1;
+  uint64 since_seq = 2;
+}
+
+message IpBanDelta {
+  uint64 seq = 1;
+  bytes ip = 2;
+  ThreatClassProto threat = 3;
+  float noul = 4;
+  float confidence = 5;
+  uint32 ttl_secs = 6;
+}
+
+message SignatureDelta {
+  uint64 seq = 1;
+  string method = 2;
+  string path_prefix = 3;
+  ThreatClassProto threat = 4;
+}
+
+message HubDeltaBatch {
+  uint64 latest_seq = 1;
+  repeated IpBanDelta ip_deltas = 2;
+  repeated SignatureDelta signature_deltas = 3;
+}
+
+message NodeStreamMessage {
+  string node_id = 1;
+  uint64 since_seq = 2;
+  SignalBatch signals = 3;
+}
+
+service CustosHubService {
+  rpc PushSignals(SignalBatch) returns (PushAck);
+  rpc PullDeltas(PullRequest) returns (HubDeltaBatch);
+  rpc StreamIntel(stream NodeStreamMessage) returns (stream HubDeltaBatch);
+}

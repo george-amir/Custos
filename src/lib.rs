@@ -1,20 +1,94 @@
 pub mod bouncer_api;
 pub mod config;
 pub mod firewall;
+pub mod hub;
+pub mod hub_proto;
 pub mod jev;
+pub mod middleware;
 pub mod sanitizer;
 pub mod store;
 pub mod tailer;
 pub mod window;
 
-use crate::firewall::FirewallBouncer;
+use crate::config::{AppConfig, FirewallConfig, JevConfig, WindowConfig};
+use crate::firewall::{FirewallBackend, FirewallBouncer};
 use crate::jev::{ActorVerdict, JevBatchAnalyzer};
 use crate::store::{DecisionSource, DecisionStore};
 use crate::tailer::AccessLogEvent;
 use crate::window::{L1Disposition, SlidingWindowEngine};
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
+
+/// Ergonomic builder for embedding `Custos` (`SecurityPipeline`) as a Rust library.
+#[derive(Debug, Clone, Default)]
+pub struct CustosBuilder {
+    config: AppConfig,
+    mock_jev: bool,
+}
+
+impl CustosBuilder {
+    pub fn new() -> Self {
+        Self {
+            config: AppConfig::default(),
+            mock_jev: false,
+        }
+    }
+
+    pub fn with_config(mut self, config: AppConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_decisions_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.daemon.decisions_file = path.into();
+        self
+    }
+
+    pub fn with_typesafe_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.config.jev.api_key = api_key.into();
+        self
+    }
+
+    pub fn with_mock_jev(mut self, mock_jev: bool) -> Self {
+        self.mock_jev = mock_jev;
+        self
+    }
+
+    pub fn with_firewall_backend(mut self, backend: FirewallBackend, dry_run: bool) -> Self {
+        self.config.firewall.backend = backend;
+        self.config.firewall.dry_run = dry_run;
+        self
+    }
+
+    pub fn with_window_config(mut self, window: WindowConfig) -> Self {
+        self.config.window = window;
+        self
+    }
+
+    pub fn with_jev_config(mut self, jev: JevConfig) -> Self {
+        self.config.jev = jev;
+        self
+    }
+
+    pub fn with_firewall_config(mut self, firewall: FirewallConfig) -> Self {
+        self.config.firewall = firewall;
+        self
+    }
+
+    pub fn build(self) -> Result<SecurityPipeline> {
+        let use_mock = self.mock_jev || self.config.jev.api_key.trim().is_empty();
+        let store = Arc::new(DecisionStore::open(
+            self.config.daemon.decisions_file,
+            self.config.daemon.default_ban_ttl_secs,
+        )?);
+        let window = Arc::new(SlidingWindowEngine::new(self.config.window));
+        let jev = Arc::new(JevBatchAnalyzer::new(self.config.jev, use_mock)?);
+        let firewall = Arc::new(FirewallBouncer::new(self.config.firewall));
+        Ok(SecurityPipeline::new(store, window, jev, firewall))
+    }
+}
 
 /// Coordinates the 3-stage pipeline:
 /// 1. Ingests `AccessLogEvent` through `SlidingWindowEngine` (skipping already-banned IPs and benign static hits).
@@ -30,6 +104,10 @@ pub struct SecurityPipeline {
 }
 
 impl SecurityPipeline {
+    pub fn builder() -> CustosBuilder {
+        CustosBuilder::new()
+    }
+
     pub fn new(
         store: Arc<DecisionStore>,
         window: Arc<SlidingWindowEngine>,

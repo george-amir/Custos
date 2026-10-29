@@ -15,6 +15,24 @@ pub struct AppConfig {
     pub jev: JevConfig,
     #[serde(default)]
     pub firewall: FirewallConfig,
+    #[serde(default)]
+    pub hub: HubConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HubConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hub_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_hub_listen")]
+    pub listen: String,
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default)]
+    pub api_token: String,
+    #[serde(default = "default_quorum_min_nodes")]
+    pub quorum_min_nodes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +55,8 @@ pub struct DaemonConfig {
     pub decisions_file: PathBuf,
     #[serde(default = "default_ban_ttl_secs")]
     pub default_ban_ttl_secs: u64,
+    #[serde(default)]
+    pub api_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +85,8 @@ pub struct WindowConfig {
     pub min_suspicion_score: u32,
     #[serde(default = "default_max_sample_requests")]
     pub max_sample_requests: usize,
+    #[serde(default = "default_max_tracked_ips")]
+    pub max_tracked_ips: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +109,18 @@ pub struct JevConfig {
     pub timeout_ms: u64,
 }
 
+fn default_hub_endpoint() -> String {
+    "http://127.0.0.1:50051".to_string()
+}
+fn default_hub_listen() -> String {
+    "127.0.0.1:50051".to_string()
+}
+fn default_node_id() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "custos-node-1".to_string())
+}
+fn default_quorum_min_nodes() -> usize {
+    1
+}
 fn default_firewall_enabled() -> bool {
     true
 }
@@ -97,7 +131,7 @@ fn default_firewall_dry_run() -> bool {
     true
 }
 fn default_firewall_table() -> String {
-    "jevsec_block".to_string()
+    "custos_block".to_string()
 }
 fn default_bouncer_listen() -> String {
     "127.0.0.1:8085".to_string()
@@ -126,6 +160,9 @@ fn default_min_suspicion_score() -> u32 {
 fn default_max_sample_requests() -> usize {
     10
 }
+fn default_max_tracked_ips() -> usize {
+    50_000
+}
 fn default_jev_endpoint() -> String {
     "https://api.typesafe.ai/v1/systemone".to_string()
 }
@@ -148,6 +185,19 @@ fn default_timeout_ms() -> u64 {
     5000
 }
 
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_hub_endpoint(),
+            listen: default_hub_listen(),
+            node_id: default_node_id(),
+            api_token: std::env::var("CUSTOS_HUB_TOKEN").unwrap_or_default(),
+            quorum_min_nodes: default_quorum_min_nodes(),
+        }
+    }
+}
+
 impl Default for FirewallConfig {
     fn default() -> Self {
         Self {
@@ -165,6 +215,7 @@ impl Default for DaemonConfig {
             bouncer_listen: default_bouncer_listen(),
             decisions_file: default_decisions_file(),
             default_ban_ttl_secs: default_ban_ttl_secs(),
+            api_token: std::env::var("CUSTOS_API_TOKEN").unwrap_or_default(),
         }
     }
 }
@@ -177,6 +228,7 @@ impl Default for WindowConfig {
             l1_flood_threshold: default_l1_flood_threshold(),
             min_suspicion_score: default_min_suspicion_score(),
             max_sample_requests: default_max_sample_requests(),
+            max_tracked_ips: default_max_tracked_ips(),
         }
     }
 }
@@ -204,6 +256,7 @@ impl Default for AppConfig {
             window: WindowConfig::default(),
             jev: JevConfig::default(),
             firewall: FirewallConfig::default(),
+            hub: HubConfig::default(),
         }
     }
 }
@@ -225,6 +278,16 @@ impl AppConfig {
         if cfg.jev.api_key.trim().is_empty() {
             if let Ok(env_key) = std::env::var("TYPESAFE_API_KEY") {
                 cfg.jev.api_key = env_key;
+            }
+        }
+        if cfg.daemon.api_token.trim().is_empty() {
+            if let Ok(tok) = std::env::var("CUSTOS_API_TOKEN") {
+                cfg.daemon.api_token = tok;
+            }
+        }
+        if cfg.hub.api_token.trim().is_empty() {
+            if let Ok(tok) = std::env::var("CUSTOS_HUB_TOKEN") {
+                cfg.hub.api_token = tok;
             }
         }
         Ok(cfg)

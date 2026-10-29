@@ -145,7 +145,9 @@ impl SlidingWindowEngine {
             .fetch_add(1, Ordering::Relaxed);
 
         // 1. Fast Static Asset & Healthcheck Drop (only if status is 200/304 and no query string)
-        if ev.query.is_empty() && (ev.status == 200 || ev.status == 304) && is_benign_static(&ev.path)
+        if ev.query.is_empty()
+            && (ev.status == 200 || ev.status == 304)
+            && is_benign_static(&ev.path)
         {
             self.metrics.static_ignored.fetch_add(1, Ordering::Relaxed);
             return L1Disposition::IgnoredStatic;
@@ -160,11 +162,20 @@ impl SlidingWindowEngine {
             self.metrics.l1_instant_bans.fetch_add(1, Ordering::Relaxed);
             return L1Disposition::InstantBan {
                 threat_class: sig_threat.value().clone(),
-                reason: format!("Matched cached Jev signature on {} {}", ev.method, path_prefix),
+                reason: format!(
+                    "Matched cached Jev signature on {} {}",
+                    ev.method, path_prefix
+                ),
             };
         }
 
-        // 3. Sanitize URI & User-Agent and extract structural signals
+        // 3. Enforce bounded memory cap (`max_tracked_ips`) against spoofed-IP floods
+        let max_ips = self.cfg.max_tracked_ips.max(64);
+        if self.windows.len() >= max_ips && !self.windows.contains_key(&ev.client_ip) {
+            self.evict_low_priority_windows(max_ips / 10 + 1);
+        }
+
+        // 4. Sanitize URI & User-Agent and extract structural signals
         let full_uri = if ev.query.is_empty() {
             ev.path.clone()
         } else {
@@ -191,7 +202,8 @@ impl SlidingWindowEngine {
                 win.suspicion_score += 1;
                 if win.status_401_403 >= 3 {
                     win.suspicion_score += 2;
-                    win.suspicion_reasons.insert("repeated_auth_failures".into());
+                    win.suspicion_reasons
+                        .insert("repeated_auth_failures".into());
                 }
             }
             404 => {
@@ -297,8 +309,7 @@ impl SlidingWindowEngine {
                 if win.suspicion_score >= self.cfg.min_suspicion_score {
                     let idx = summaries.len();
                     let error_count = win.status_401_403 + win.status_404 + win.status_5xx;
-                    let error_ratio =
-                        (error_count as f64) / (win.total_requests.max(1) as f64);
+                    let error_ratio = (error_count as f64) / (win.total_requests.max(1) as f64);
                     let duration = ((win.last_seen - win.first_seen).num_seconds().max(1)) as u64;
                     let req_per_sec = (win.total_requests as f64) / (duration as f64);
 
@@ -333,6 +344,21 @@ impl SlidingWindowEngine {
             .windows_promoted_to_jev
             .fetch_add(summaries.len() as u64, Ordering::Relaxed);
         summaries
+    }
+
+    fn evict_low_priority_windows(&self, target_to_evict: usize) {
+        let mut candidates = Vec::new();
+        for item in self.windows.iter() {
+            if item.value().suspicion_score < self.cfg.min_suspicion_score {
+                candidates.push(*item.key());
+                if candidates.len() >= target_to_evict {
+                    break;
+                }
+            }
+        }
+        for ip in candidates {
+            self.windows.remove(&ip);
+        }
     }
 }
 
@@ -372,7 +398,11 @@ pub fn normalize_path_prefix(path: &str) -> String {
     if trimmed.is_empty() {
         return "/".to_string();
     }
-    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).take(2).collect();
+    let segments: Vec<&str> = trimmed
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .take(3)
+        .collect();
     if segments.is_empty() {
         "/".to_string()
     } else {

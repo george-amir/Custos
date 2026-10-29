@@ -1,28 +1,36 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use jevsec::SecurityPipeline;
-use jevsec::bouncer_api::{
+use custos::SecurityPipeline;
+use custos::bouncer_api::{
     AppState, BouncerCheckResponse, FirewallStatusResponse, ManualBanRequest, StatsResponse,
     build_bouncer_router,
 };
-use jevsec::config::{AppConfig, LogFormat, LogSourceConfig};
-use jevsec::firewall::{FirewallBackend, FirewallBouncer};
-use jevsec::jev::JevBatchAnalyzer;
-use jevsec::store::{BanDecision, DecisionStore};
-use jevsec::tailer::{replay_log_file, spawn_log_tailer};
-use jevsec::window::SlidingWindowEngine;
-use std::net::IpAddr;
+use custos::config::{AppConfig, LogFormat, LogSourceConfig};
+use custos::firewall::{FirewallBackend, FirewallBouncer};
+use custos::hub::proto::NodeStreamMessage;
+use custos::hub::proto::custos_hub_service_client::CustosHubServiceClient;
+use custos::hub::{
+    CustosHubGrpcService, HubEngine, apply_hub_delta_to_pipeline, build_signal_batch_from_verdicts,
+    pull_and_apply_via_grpc, push_verdicts_via_grpc,
+};
+use custos::jev::JevBatchAnalyzer;
+use custos::store::{BanDecision, DecisionStore};
+use custos::tailer::{replay_log_file, spawn_log_tailer};
+use custos::window::SlidingWindowEngine;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "jevsec",
+    name = "custos",
     version,
-    about = "CrowdSec-inspired behavioral security engine powered by TypeSafe AI's Jev (/v1/systemone)"
+    about = "Custos: Autonomous behavioral security engine & cross-platform firewall bouncer powered by TypeSafe AI's Jev (/v1/systemone)"
 )]
 struct Cli {
     /// Path to config.toml
@@ -35,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the jevsec daemon (tails configured log files, runs Jev batch analyzer, serves Bouncer HTTP API & OS Firewall Bouncer)
+    /// Run the custos daemon (tails configured log files, runs Jev batch analyzer, serves Bouncer HTTP API, OS Firewall, and gRPC Hub stream)
     Run {
         /// Additional log file to tail (can be specified without a config file)
         #[arg(long)]
@@ -56,9 +64,17 @@ enum Commands {
         /// Execute live OS kernel firewall commands instead of dry-run simulation (requires root/Administrator)
         #[arg(long, default_value_t = false)]
         firewall_live: bool,
+
+        /// Connect to a CustosHub gRPC coordinator (e.g. http://127.0.0.1:50051) for real-time bidirectional streaming sync
+        #[arg(long)]
+        hub: Option<String>,
+
+        /// Unique node identifier when reporting to CustosHub
+        #[arg(long)]
+        node_id: Option<String>,
     },
 
-    /// Replay a log file from start to finish, evaluate suspicious windows in bulk via Jev, and print results
+    /// Replay a log file from start to finish, evaluate suspicious windows in bulk via Jev, and optionally push verdicts to CustosHub over gRPC
     Replay {
         /// Path to access log file
         #[arg(long)]
@@ -77,6 +93,44 @@ enum Commands {
         firewall_backend: Option<String>,
 
         /// Execute live OS kernel firewall commands instead of dry-run simulation (requires root/Administrator)
+        #[arg(long, default_value_t = false)]
+        firewall_live: bool,
+
+        /// Push convicted Jev verdicts & L1 signatures to a CustosHub gRPC endpoint (e.g. http://127.0.0.1:50051)
+        #[arg(long)]
+        hub: Option<String>,
+
+        /// Unique node identifier when reporting to CustosHub
+        #[arg(long)]
+        node_id: Option<String>,
+    },
+
+    /// Run the standalone gRPC Threat-Intelligence Hub server (`CustosHubService` over HTTP/2)
+    Hub {
+        /// Address for the gRPC server to listen on
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        listen: String,
+
+        /// Minimum distinct reporting nodes required to promote an IP or signature globally
+        #[arg(long, default_value_t = 1)]
+        quorum: usize,
+    },
+
+    /// Pull incremental IP & L1 signature deltas from a CustosHub gRPC server and apply them in a single batched OS firewall call
+    HubSync {
+        /// CustosHub gRPC endpoint URL
+        #[arg(long, default_value = "http://127.0.0.1:50051")]
+        hub: String,
+
+        /// Sequence cursor (0 fetches all active intelligence)
+        #[arg(long, default_value_t = 0)]
+        since_seq: u64,
+
+        /// Override OS firewall backend: auto, pf, nftables, ipset, windows_netsh
+        #[arg(long)]
+        firewall_backend: Option<String>,
+
+        /// Execute live OS kernel firewall commands instead of dry-run simulation
         #[arg(long, default_value_t = false)]
         firewall_live: bool,
     },
@@ -103,7 +157,7 @@ enum Commands {
         ip: IpAddr,
         #[arg(long, default_value = "manual_block")]
         threat: String,
-        #[arg(long, default_value = "Manually banned via jevsec CLI")]
+        #[arg(long, default_value = "Manually banned via custos CLI")]
         reason: String,
         #[arg(long)]
         ttl_secs: Option<u64>,
@@ -152,6 +206,8 @@ async fn main() -> Result<()> {
             mock_jev,
             firewall_backend,
             firewall_live,
+            hub,
+            node_id,
         } => {
             if let Some(log_path) = log {
                 cfg.logs.push(LogSourceConfig {
@@ -165,6 +221,13 @@ async fn main() -> Result<()> {
             if firewall_live {
                 cfg.firewall.dry_run = false;
             }
+            if let Some(hub_url) = hub {
+                cfg.hub.enabled = true;
+                cfg.hub.endpoint = hub_url;
+            }
+            if let Some(nid) = node_id {
+                cfg.hub.node_id = nid;
+            }
             run_daemon(cfg, from_start, mock_jev).await
         }
         Commands::Replay {
@@ -173,6 +236,8 @@ async fn main() -> Result<()> {
             mock_jev,
             firewall_backend,
             firewall_live,
+            hub,
+            node_id,
         } => {
             let fmt = if format.eq_ignore_ascii_case("json") {
                 LogFormat::Json
@@ -185,7 +250,29 @@ async fn main() -> Result<()> {
             if firewall_live {
                 cfg.firewall.dry_run = false;
             }
+            if let Some(hub_url) = hub {
+                cfg.hub.enabled = true;
+                cfg.hub.endpoint = hub_url;
+            }
+            if let Some(nid) = node_id {
+                cfg.hub.node_id = nid;
+            }
             run_replay(cfg, &log, fmt, mock_jev).await
+        }
+        Commands::Hub { listen, quorum } => run_hub_server(&listen, quorum).await,
+        Commands::HubSync {
+            hub,
+            since_seq,
+            firewall_backend,
+            firewall_live,
+        } => {
+            if let Some(b) = firewall_backend {
+                cfg.firewall.backend = parse_backend(&b);
+            }
+            if firewall_live {
+                cfg.firewall.dry_run = false;
+            }
+            cmd_hub_sync(cfg, &hub, since_seq).await
         }
         Commands::Firewall { backend, live } => cmd_firewall(cfg, &backend, live),
         Commands::Decisions { api_url } => cmd_decisions(&api_url, &cfg).await,
@@ -212,6 +299,57 @@ fn parse_backend(s: &str) -> FirewallBackend {
     }
 }
 
+async fn run_hub_server(listen: &str, quorum: usize) -> Result<()> {
+    let addr: SocketAddr = listen
+        .parse()
+        .with_context(|| format!("Invalid gRPC listen socket address: {listen}"))?;
+    let engine = Arc::new(HubEngine::new(quorum));
+    let svc = CustosHubGrpcService::new(engine);
+
+    info!(
+        listen = %addr,
+        quorum_min_nodes = quorum.max(1),
+        "CustosHub gRPC Threat-Intelligence Server listening (HTTP/2 Protobuf streaming)"
+    );
+
+    tonic::transport::Server::builder()
+        .add_service(svc.into_server())
+        .serve(addr)
+        .await
+        .context("CustosHub gRPC server terminated with error")?;
+    Ok(())
+}
+
+async fn cmd_hub_sync(cfg: AppConfig, hub_endpoint: &str, since_seq: u64) -> Result<()> {
+    let store = Arc::new(DecisionStore::open(
+        cfg.daemon.decisions_file.clone(),
+        cfg.daemon.default_ban_ttl_secs,
+    )?);
+    let window = Arc::new(SlidingWindowEngine::new(cfg.window.clone()));
+    let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), true)?);
+    let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
+    let pipeline =
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
+
+    let (latest_seq, ips_applied, sigs_applied) =
+        pull_and_apply_via_grpc(hub_endpoint, &cfg.hub.node_id, since_seq, &pipeline).await?;
+
+    println!(
+        "=== CustosHub gRPC Delta Sync Complete (endpoint={}, since_seq={} -> latest_seq={}) ===",
+        hub_endpoint, since_seq, latest_seq
+    );
+    println!("  New IP Bans Applied       : {ips_applied}");
+    println!("  New L1 Signatures Applied : {sigs_applied}");
+    println!(
+        "  Batched Firewall Commands : {}",
+        firewall.recent_commands().len()
+    );
+    for cmd in firewall.recent_commands() {
+        println!("    $ {cmd}");
+    }
+    Ok(())
+}
+
 async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<()> {
     let use_mock = mock_jev || cfg.jev.api_key.trim().is_empty();
     if use_mock && !mock_jev {
@@ -225,19 +363,105 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
     let window = Arc::new(SlidingWindowEngine::new(cfg.window.clone()));
     let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), use_mock)?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline = SecurityPipeline::new(
-        store.clone(),
-        window.clone(),
-        jev.clone(),
-        firewall.clone(),
-    );
+    let pipeline =
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
 
-    // Sync any restored active bans from disk into the OS firewall on startup
-    for decision in store.list_active() {
-        let ttl = (decision.expires_at - chrono::Utc::now())
-            .num_seconds()
-            .max(1) as u64;
-        let _ = firewall.ban_ip(decision.ip, ttl);
+    // Sync any restored active bans from disk into the OS firewall in a single batch call on startup
+    let existing: Vec<(IpAddr, u64)> = store
+        .list_active()
+        .into_iter()
+        .map(|d| {
+            let ttl = (d.expires_at - chrono::Utc::now()).num_seconds().max(1) as u64;
+            (d.ip, ttl)
+        })
+        .collect();
+    if !existing.is_empty() {
+        let _ = firewall.ban_ips_batch(&existing);
+    }
+
+    // Background TTL expiry sweeper & persistence compaction task (runs every 60s)
+    let sweep_store = store.clone();
+    let sweep_fw = firewall.clone();
+    tokio::spawn(async move {
+        let mut sweep_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            sweep_ticker.tick().await;
+            let expired = sweep_store.sweep_expired();
+            if !expired.is_empty() {
+                for ip in &expired {
+                    let _ = sweep_fw.unban_ip(*ip);
+                }
+                let _ = sweep_store.compact_persistence_file();
+                info!(
+                    expired_count = expired.len(),
+                    "Swept expired IP bans and compacted persistence store"
+                );
+            }
+        }
+    });
+
+    // Optional bidirectional gRPC stream to CustosHub
+    let (hub_tx, mut hub_rx) = mpsc::channel(256);
+    if cfg.hub.enabled {
+        let hub_endpoint = cfg.hub.endpoint.clone();
+        let node_id = cfg.hub.node_id.clone();
+        let stream_pipeline = pipeline.clone();
+        tokio::spawn(async move {
+            match CustosHubServiceClient::connect(hub_endpoint.clone()).await {
+                Ok(mut client) => {
+                    let (outbound_tx, outbound_rx) = mpsc::channel(128);
+                    // Send initial handshake with since_seq = 0
+                    let _ = outbound_tx
+                        .send(NodeStreamMessage {
+                            node_id: node_id.clone(),
+                            since_seq: 0,
+                            signals: None,
+                        })
+                        .await;
+
+                    let forward_node_id = node_id.clone();
+                    tokio::spawn(async move {
+                        while let Some(batch) = hub_rx.recv().await {
+                            let msg = NodeStreamMessage {
+                                node_id: forward_node_id.clone(),
+                                since_seq: 0,
+                                signals: Some(batch),
+                            };
+                            if outbound_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    match client.stream_intel(ReceiverStream::new(outbound_rx)).await {
+                        Ok(resp) => {
+                            info!(endpoint = %hub_endpoint, node_id = %node_id, "Connected to CustosHub bidirectional gRPC stream");
+                            let mut inbound = resp.into_inner();
+                            while let Some(Ok(delta)) = inbound.next().await {
+                                if let Ok((ips, sigs)) =
+                                    apply_hub_delta_to_pipeline(&stream_pipeline, &delta)
+                                {
+                                    if ips > 0 || sigs > 0 {
+                                        info!(
+                                            latest_seq = delta.latest_seq,
+                                            ips_applied = ips,
+                                            sigs_applied = sigs,
+                                            "Applied real-time gRPC HubDeltaBatch from CustosHub"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "Failed to open CustosHub gRPC StreamIntel")
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(endpoint = %hub_endpoint, error = %err, "Could not connect to CustosHub gRPC server")
+                }
+            }
+        });
     }
 
     let (tx, mut rx) = mpsc::channel(8192);
@@ -257,16 +481,33 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
 
     let flush_pipeline = pipeline.clone();
     let flush_ms = cfg.window.flush_interval_ms.max(500);
+    let hub_enabled = cfg.hub.enabled;
+    let node_id = cfg.hub.node_id.clone();
+    let api_token = cfg.hub.api_token.clone();
+    let default_ttl = cfg.daemon.default_ban_ttl_secs;
+
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(flush_ms));
         loop {
             ticker.tick().await;
-            if let Err(err) = flush_pipeline.flush_and_analyze(false).await {
-                error!(error = %err, "Jev batch flush failed");
+            match flush_pipeline.flush_and_analyze(false).await {
+                Ok(verdicts) => {
+                    if hub_enabled && !verdicts.is_empty() {
+                        let sig_batch = build_signal_batch_from_verdicts(
+                            &node_id,
+                            &api_token,
+                            &verdicts,
+                            default_ttl,
+                        );
+                        let _ = hub_tx.send(sig_batch).await;
+                    }
+                }
+                Err(err) => error!(error = %err, "Jev batch flush failed"),
             }
         }
     });
 
+    let shutdown_pipeline = pipeline.clone();
     let app_state = AppState {
         store,
         window,
@@ -276,17 +517,29 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
     let router = build_bouncer_router(app_state);
     let listener = tokio::net::TcpListener::bind(&cfg.daemon.bouncer_listen)
         .await
-        .with_context(|| format!("Failed to bind Bouncer API on {}", cfg.daemon.bouncer_listen))?;
+        .with_context(|| {
+            format!(
+                "Failed to bind Bouncer API on {}",
+                cfg.daemon.bouncer_listen
+            )
+        })?;
 
     info!(
         listen = %cfg.daemon.bouncer_listen,
         mock_jev = use_mock,
         firewall_backend = firewall.resolved_backend().as_str(),
         firewall_dry_run = firewall.is_dry_run(),
-        "JevSec daemon listening (HTTP Bouncer: GET /v1/bouncer/check?ip=<IP>, Firewall status: GET /v1/firewall)"
+        "Custos daemon listening (HTTP Bouncer: GET /v1/bouncer/check?ip=<IP>, Metrics: GET /metrics)"
     );
 
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutdown signal received; flushing pending windows and compacting store...");
+            let _ = shutdown_pipeline.flush_and_analyze(true).await;
+            let _ = shutdown_pipeline.store.compact_persistence_file();
+        })
+        .await?;
     Ok(())
 }
 
@@ -304,16 +557,12 @@ async fn run_replay(
     let window = Arc::new(SlidingWindowEngine::new(cfg.window.clone()));
     let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), use_mock)?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline = SecurityPipeline::new(
-        store.clone(),
-        window.clone(),
-        jev.clone(),
-        firewall.clone(),
-    );
+    let pipeline =
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
 
     let events = replay_log_file(log_path, format)?;
     println!(
-        "=== JevSec Replay: {} ({} parsed events, mode={}, firewall={} [dry_run={}]) ===",
+        "=== Custos Replay: {} ({} parsed events, mode={}, firewall={} [dry_run={}]) ===",
         log_path.display(),
         events.len(),
         if use_mock { "mock-jev" } else { "live-jev" },
@@ -327,12 +576,35 @@ async fn run_replay(
 
     let verdicts = pipeline.flush_and_analyze(true).await?;
 
+    if cfg.hub.enabled && !verdicts.is_empty() {
+        let ack = push_verdicts_via_grpc(
+            &cfg.hub.endpoint,
+            &cfg.hub.node_id,
+            &cfg.hub.api_token,
+            &verdicts,
+            cfg.daemon.default_ban_ttl_secs,
+        )
+        .await?;
+        println!(
+            "\n--- CustosHub gRPC Signal Push ({}) ---\n  Node ID              : {}\n  Accepted IP Signals  : {}\n  Accepted Signatures  : {}\n  Rejected Canary      : {}\n  Hub Latest Seq       : {}",
+            cfg.hub.endpoint,
+            cfg.hub.node_id,
+            ack.accepted_ips,
+            ack.accepted_signatures,
+            ack.rejected_canary,
+            ack.latest_seq
+        );
+    }
+
     println!(
         "\n--- L1 & Window Telemetry ---\n  Events Processed     : {}\n  Static Assets Ignored: {}\n  L1 Instant Bans      : {}\n  Promoted to Jev L2   : {}",
         window.metrics.events_processed.load(Ordering::Relaxed),
         window.metrics.static_ignored.load(Ordering::Relaxed),
         window.metrics.l1_instant_bans.load(Ordering::Relaxed),
-        window.metrics.windows_promoted_to_jev.load(Ordering::Relaxed),
+        window
+            .metrics
+            .windows_promoted_to_jev
+            .load(Ordering::Relaxed),
     );
 
     let in_tok = jev.metrics.input_tokens_total.load(Ordering::Relaxed);
@@ -392,6 +664,13 @@ fn cmd_firewall(mut cfg: AppConfig, backend_arg: &str, live: bool) -> Result<()>
         cfg.daemon.default_ban_ttl_secs,
     )?;
     let active = store.list_active();
+    let batch_entries: Vec<(IpAddr, u64)> = active
+        .iter()
+        .map(|d| {
+            let ttl = (d.expires_at - chrono::Utc::now()).num_seconds().max(60) as u64;
+            (d.ip, ttl)
+        })
+        .collect();
 
     if backend_arg.eq_ignore_ascii_case("all") {
         let backends = [
@@ -401,7 +680,7 @@ fn cmd_firewall(mut cfg: AppConfig, backend_arg: &str, live: bool) -> Result<()>
             FirewallBackend::WindowsNetsh,
         ];
         println!(
-            "=== Cross-Platform OS Firewall Preview ({} active bans) ===",
+            "=== Cross-Platform OS Firewall Preview ({} active bans, batched mode) ===",
             active.len()
         );
         for b in backends {
@@ -413,9 +692,8 @@ fn cmd_firewall(mut cfg: AppConfig, backend_arg: &str, live: bool) -> Result<()>
             for init_spec in fw.build_init_commands() {
                 println!("  $ {}", init_spec.to_shell_string());
             }
-            for d in &active {
-                let ttl = (d.expires_at - chrono::Utc::now()).num_seconds().max(60) as u64;
-                println!("  $ {}", fw.build_ban_command(d.ip, ttl).to_shell_string());
+            for batch_spec in fw.build_batch_ban_commands(&batch_entries) {
+                println!("  $ {}", batch_spec.to_shell_string());
             }
         }
         return Ok(());
@@ -428,16 +706,14 @@ fn cmd_firewall(mut cfg: AppConfig, backend_arg: &str, live: bool) -> Result<()>
 
     let fw = FirewallBouncer::new(cfg.firewall);
     let _ = fw.init_backend()?;
-    for d in &active {
-        let ttl = (d.expires_at - chrono::Utc::now()).num_seconds().max(60) as u64;
-        fw.ban_ip(d.ip, ttl)?;
-    }
+    fw.ban_ips_batch(&batch_entries)?;
 
     println!(
-        "=== OS Firewall Sync Complete (backend={}, dry_run={}, rules_applied={}) ===",
+        "=== OS Firewall Sync Complete (backend={}, dry_run={}, rules_applied={}, commands={}) ===",
         fw.resolved_backend().as_str(),
         fw.is_dry_run(),
-        fw.metrics.rules_applied.load(Ordering::Relaxed)
+        fw.metrics.rules_applied.load(Ordering::Relaxed),
+        fw.recent_commands().len()
     );
     for cmd in fw.recent_commands() {
         println!("  $ {cmd}");

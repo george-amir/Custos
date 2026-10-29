@@ -1,9 +1,12 @@
-# JevSec v0.1 Example Configuration
+# Custos v0.1 Example Configuration
 
 [daemon]
 bouncer_listen = "127.0.0.1:8085"
 decisions_file = "decisions.jsonl"
 default_ban_ttl_secs = 3600
+# Optional Bearer token required for mutating API endpoints (POST/DELETE /v1/decisions)
+# Can also be set via CUSTOS_API_TOKEN environment variable
+api_token = ""
 
 [[logs]]
 path = "tests/fixtures/sample_access.log"
@@ -20,6 +23,8 @@ l1_flood_threshold = 120
 min_suspicion_score = 2
 # Maximum sample requests retained per IP window for Jev state compaction
 max_sample_requests = 10
+# Hard cap on concurrently tracked IP windows in memory to prevent spoofed-IP DDoS OOM
+max_tracked_ips = 50000
 
 [jev]
 endpoint = "https://api.typesafe.ai/v1/systemone"
@@ -46,4 +51,16 @@ backend = "auto"
 # When true, records & logs the exact OS firewall commands without requiring root/sudo.
 # Set to false (or pass --firewall-live) when running with root/Administrator privileges.
 dry_run = true
-table_name = "jevsec_block"
+table_name = "custos_block"
+
+[hub]
+# Enable gRPC Threat-Intelligence Hub synchronization (tonic HTTP/2 streaming)
+enabled = false
+endpoint = "http://127.0.0.1:50051"
+listen = "127.0.0.1:50051"
+node_id = "custos-node-1"
+# Optional shared token for authenticating PushSignals / StreamIntel RPCs (or CUSTOS_HUB_TOKEN env)
+api_token = ""
+# Minimum distinct reporting nodes required to promote an IP or signature globally
+# (1 = trusted private fleet, 3+ = untrusted community quorum)
+quorum_min_nodes = 1

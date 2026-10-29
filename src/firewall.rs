@@ -144,6 +144,75 @@ impl FirewallBouncer {
         Ok(spec.to_shell_string())
     }
 
+    /// Blocks a slice of `(IpAddr, ttl_secs)` entries in a single batched OS firewall
+    /// command where supported (`pfctl` and `nftables`), eliminating per-IP process spawn overhead.
+    pub fn ban_ips_batch(&self, entries: &[(IpAddr, u64)]) -> Result<Vec<String>> {
+        if !self.cfg.enabled || entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let specs = self.build_batch_ban_commands(entries);
+        let out = self.execute_specs(&specs)?;
+        self.metrics
+            .rules_applied
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// Pure function that packs multiple `(IpAddr, ttl_secs)` entries into minimal OS commands.
+    pub fn build_batch_ban_commands(&self, entries: &[(IpAddr, u64)]) -> Vec<FirewallCommandSpec> {
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let table = &self.cfg.table_name;
+        match self.resolved_backend {
+            FirewallBackend::Pf | FirewallBackend::Auto => {
+                // `pfctl -t <table> -T add ip1 ip2 ip3 ...` accepts all IPs in one call
+                let mut args = vec![
+                    "-t".to_string(),
+                    table.clone(),
+                    "-T".to_string(),
+                    "add".to_string(),
+                ];
+                for (ip, _) in entries {
+                    args.push(ip.to_string());
+                }
+                vec![FirewallCommandSpec::new("pfctl", args)]
+            }
+            FirewallBackend::Nftables => {
+                let mut v4_elems = Vec::new();
+                let mut v6_elems = Vec::new();
+                for (ip, ttl) in entries {
+                    let t = (*ttl).max(1);
+                    if ip.is_ipv4() {
+                        v4_elems.push(format!("{ip} timeout {t}s"));
+                    } else {
+                        v6_elems.push(format!("{ip} timeout {t}s"));
+                    }
+                }
+                let mut specs = Vec::new();
+                if !v4_elems.is_empty() {
+                    let set_expr = format!("{{ {} }}", v4_elems.join(", "));
+                    specs.push(FirewallCommandSpec::new(
+                        "nft",
+                        ["add", "element", "inet", table, "block_v4", &set_expr],
+                    ));
+                }
+                if !v6_elems.is_empty() {
+                    let set_expr = format!("{{ {} }}", v6_elems.join(", "));
+                    specs.push(FirewallCommandSpec::new(
+                        "nft",
+                        ["add", "element", "inet", table, "block_v6", &set_expr],
+                    ));
+                }
+                specs
+            }
+            FirewallBackend::Ipset | FirewallBackend::WindowsNetsh => entries
+                .iter()
+                .map(|(ip, ttl)| self.build_ban_command(*ip, *ttl))
+                .collect(),
+        }
+    }
+
     /// Removes `ip` from the OS firewall table/set.
     pub fn unban_ip(&self, ip: IpAddr) -> Result<String> {
         if !self.cfg.enabled {
@@ -287,12 +356,11 @@ impl FirewallBouncer {
                     ],
                 )
             }
-            FirewallBackend::Pf | FirewallBackend::Auto => FirewallCommandSpec::new(
-                "pfctl",
-                ["-t", table, "-T", "add", &ip.to_string()],
-            ),
+            FirewallBackend::Pf | FirewallBackend::Auto => {
+                FirewallCommandSpec::new("pfctl", ["-t", table, "-T", "add", &ip.to_string()])
+            }
             FirewallBackend::WindowsNetsh => {
-                let rule_name = format!("name=JevSec-Block-{}", ip);
+                let rule_name = format!("name=Custos-Block-{}", ip);
                 let remote_ip = format!("remoteip={}", ip);
                 FirewallCommandSpec::new(
                     "netsh",
@@ -331,12 +399,11 @@ impl FirewallBouncer {
                 };
                 FirewallCommandSpec::new("ipset", ["del", &set_name, &ip.to_string(), "-exist"])
             }
-            FirewallBackend::Pf | FirewallBackend::Auto => FirewallCommandSpec::new(
-                "pfctl",
-                ["-t", table, "-T", "delete", &ip.to_string()],
-            ),
+            FirewallBackend::Pf | FirewallBackend::Auto => {
+                FirewallCommandSpec::new("pfctl", ["-t", table, "-T", "delete", &ip.to_string()])
+            }
             FirewallBackend::WindowsNetsh => {
-                let rule_name = format!("name=JevSec-Block-{}", ip);
+                let rule_name = format!("name=Custos-Block-{}", ip);
                 FirewallCommandSpec::new(
                     "netsh",
                     ["advfirewall", "firewall", "delete", "rule", &rule_name],
@@ -391,7 +458,7 @@ impl FirewallBouncer {
                         command = %cmd_str,
                         status = %out.status,
                         stderr = %stderr.trim(),
-                        "OS firewall command returned non-zero status (ensure jevsec runs with root/Administrator privileges or set firewall.dry_run = true)"
+                        "OS firewall command returned non-zero status (ensure custos runs with root/Administrator privileges or set firewall.dry_run = true)"
                     );
                 }
                 Err(err) => {
@@ -428,7 +495,7 @@ mod tests {
             enabled: true,
             backend,
             dry_run: true,
-            table_name: "jevsec_block".to_string(),
+            table_name: "custos_block".to_string(),
         }
     }
 
@@ -441,19 +508,19 @@ mod tests {
         let ban4 = fw.build_ban_command(ip4, 3600);
         assert_eq!(
             ban4.to_shell_string(),
-            "nft add element inet jevsec_block block_v4 { 198.51.100.44 timeout 3600s }"
+            "nft add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s }"
         );
 
         let ban6 = fw.build_ban_command(ip6, 1800);
         assert_eq!(
             ban6.to_shell_string(),
-            "nft add element inet jevsec_block block_v6 { 2001:db8::dead:beef timeout 1800s }"
+            "nft add element inet custos_block block_v6 { 2001:db8::dead:beef timeout 1800s }"
         );
 
         let unban4 = fw.build_unban_command(ip4);
         assert_eq!(
             unban4.to_shell_string(),
-            "nft delete element inet jevsec_block block_v4 { 198.51.100.44 }"
+            "nft delete element inet custos_block block_v4 { 198.51.100.44 }"
         );
     }
 
@@ -465,13 +532,13 @@ mod tests {
         let ban = fw.build_ban_command(ip, 3600);
         assert_eq!(
             ban.to_shell_string(),
-            "pfctl -t jevsec_block -T add 203.0.113.88"
+            "pfctl -t custos_block -T add 203.0.113.88"
         );
 
         let unban = fw.build_unban_command(ip);
         assert_eq!(
             unban.to_shell_string(),
-            "pfctl -t jevsec_block -T delete 203.0.113.88"
+            "pfctl -t custos_block -T delete 203.0.113.88"
         );
     }
 
@@ -481,17 +548,41 @@ mod tests {
         let ip: IpAddr = "198.51.100.99".parse().unwrap();
         assert_eq!(
             fw_ipset.build_ban_command(ip, 600).to_shell_string(),
-            "ipset add jevsec_block_v4 198.51.100.99 timeout 600 -exist"
+            "ipset add custos_block_v4 198.51.100.99 timeout 600 -exist"
         );
 
         let fw_win = FirewallBouncer::new(test_cfg(FirewallBackend::WindowsNetsh));
         assert_eq!(
             fw_win.build_ban_command(ip, 600).to_shell_string(),
-            "netsh advfirewall firewall add rule name=JevSec-Block-198.51.100.99 dir=in action=block remoteip=198.51.100.99"
+            "netsh advfirewall firewall add rule name=Custos-Block-198.51.100.99 dir=in action=block remoteip=198.51.100.99"
         );
         assert_eq!(
             fw_win.build_unban_command(ip).to_shell_string(),
-            "netsh advfirewall firewall delete rule name=JevSec-Block-198.51.100.99"
+            "netsh advfirewall firewall delete rule name=Custos-Block-198.51.100.99"
+        );
+    }
+
+    #[test]
+    fn test_batch_ban_command_packing_pf_and_nftables() {
+        let entries: Vec<(IpAddr, u64)> = vec![
+            ("198.51.100.44".parse().unwrap(), 3600),
+            ("203.0.113.88".parse().unwrap(), 3600),
+        ];
+
+        let fw_pf = FirewallBouncer::new(test_cfg(FirewallBackend::Pf));
+        let pf_cmds = fw_pf.build_batch_ban_commands(&entries);
+        assert_eq!(pf_cmds.len(), 1);
+        assert_eq!(
+            pf_cmds[0].to_shell_string(),
+            "pfctl -t custos_block -T add 198.51.100.44 203.0.113.88"
+        );
+
+        let fw_nft = FirewallBouncer::new(test_cfg(FirewallBackend::Nftables));
+        let nft_cmds = fw_nft.build_batch_ban_commands(&entries);
+        assert_eq!(nft_cmds.len(), 1);
+        assert_eq!(
+            nft_cmds[0].to_shell_string(),
+            "nft add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s, 203.0.113.88 timeout 3600s }"
         );
     }
 }
