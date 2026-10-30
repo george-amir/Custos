@@ -623,6 +623,8 @@ impl CustosHubService for CustosHubGrpcService {
                 }
             }
         });
+        // Tonic requires Result<_, Status>; this adapter only holds the permit and forwards items.
+        #[allow(clippy::result_large_err)]
         let guarded = ReceiverStream::new(rx).map(move |item| {
             let _ = &stream_permit;
             item
