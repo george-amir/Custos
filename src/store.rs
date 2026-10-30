@@ -95,13 +95,12 @@ impl DecisionStore {
     /// Checks if `ip` is currently banned in sub-microsecond time.
     /// Automatically evicts the entry if its TTL has expired.
     pub fn check_ip(&self, ip: &IpAddr) -> Option<BanDecision> {
-        if let Some(entry) = self.active_bans.get(ip) {
+        {
+            let entry = self.active_bans.get(ip)?;
             let now = Utc::now();
             if !entry.is_expired(now) {
                 return Some(entry.value().clone());
             }
-        } else {
-            return None;
         }
         // Expired: remove outside read guard
         self.active_bans.remove(ip);
@@ -150,7 +149,7 @@ impl DecisionStore {
             .filter(|e| !e.value().is_expired(now))
             .map(|e| e.value().clone())
             .collect();
-        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         list
     }
 

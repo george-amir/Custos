@@ -2,6 +2,7 @@ pub mod bouncer_api;
 pub mod config;
 pub mod firewall;
 pub mod hub;
+#[allow(clippy::all)]
 pub mod hub_proto;
 pub mod jev;
 pub mod middleware;
