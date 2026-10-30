@@ -80,7 +80,11 @@ fn docker_config_monitors_mounted_nginx_logs_and_enforces_bans() {
         toml::from_str(include_str!("../config.docker.toml")).unwrap();
     assert_eq!(cfg.logs.len(), 1);
     assert_eq!(cfg.logs[0].path, Path::new("/var/log/nginx/access.log"));
-    assert!(cfg.daemon.decisions_file.is_absolute());
+    // This path belongs to the Linux container, regardless of the test host OS.
+    assert_eq!(
+        cfg.daemon.decisions_file,
+        Path::new("/var/lib/custos/decisions.jsonl")
+    );
     assert!(cfg.firewall.enabled);
     assert!(!cfg.firewall.dry_run);
     assert_eq!(
