@@ -38,18 +38,23 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 ---
 
-## v0.2.0: Security and Reliability Update
+## v0.3.0: Memory Limits and Screening Hardening
 
-[Download v0.2.0](https://github.com/george-amir/Custos/releases/tag/v0.2.0) for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), or Windows (x86_64).
+[Download v0.3.0](https://github.com/george-amir/Custos/releases/tag/v0.3.0) for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), or Windows (x86_64).
 
-This release adds authenticated administrative and Hub operations, trusted proxy handling, conservative exploit-signature learning, and private credential files. Durable ban and unban records survive concurrent writes and restarts; failed firewall operations are reported and retried. Hub synchronization reconnects without extending expired bans or losing queued reports. Log ingestion handles rotation, partial records, and native Caddy JSON. Windows services, macOS service stopping, Docker enforcement, and Linux ARM64 release packaging are covered by regression or platform CI checks.
+This release adds bounded ban/cleanup storage, byte-budgeted ingestion, bounded provider responses, and capacity/expiry controls for Hub state and local signatures. Static requests count toward flood limits; windows expire during provider outages; malformed analysis answers are rejected without losing retry work. Screening handles encoded paths and SQL comment separators, redacts known credentials, and retains triggering payload samples. CLI replay streams large logs.
 
-### Upgrading from v0.1.x
+Validation includes 95 passing tests and isolated sustained-load runs: 612,000 simulated requests over 60 seconds with small limits (14.5 MiB peak RSS), and 24,000 over 75 seconds with default limits (31.9 MiB peak RSS). These are memory-saturation profiles, not production throughput or model-accuracy measurements.
 
-- **Administrative API:** configure the same `CUSTOS_API_TOKEN` (or `daemon.api_token`) in the daemon and CLI. An empty token disables POST/DELETE mutations with HTTP 503; read-only bouncer checks remain available.
-- **Hub deployments:** upgrade the Hub and every node together. All RPCs require credentials, and IP deltas include absolute expiry. Give each independent quorum voter a distinct entry in `hub.node_tokens`; a shared token counts as one identity.
-- **Embedded Rust applications:** `SecurityPipeline::new` returns `Result`, `AppState` takes `{ pipeline, api_token }`, and `DecisionStore::remove_ban` returns `Result<bool>`. Supply Axum `ConnectInfo<SocketAddr>` and configure only trusted proxy peers. Run periodic analysis and firewall reconciliation as shown in [the embedded example](examples/axum_embedded.rs).
-- **Source builds:** Rust 1.88 or newer is required. After installing, `custos --version` should report `custos 0.2.0`.
+### Upgrading from v0.2.x
+
+- **Configuration:** existing TOML files receive defaults for the new `[memory]` section. Review `config.example.toml`; the 64 MiB window reservation budget is separate from queue, ban, and Hub limits and is not a process RSS ceiling.
+- **Overload:** existing bans and cleanup obligations are preserved. New admissions can fail at capacity; embedded requests and bouncer checks for unknown clients return HTTP 503 when the decision store is full. Include static assets when sizing the flood threshold.
+- **Persistence:** the journal must fit the configured decision capacity; reasons are limited to 512 bytes, threat names to 64 bytes, and journal records to 4 KiB. Startup rejects incompatible records explicitly. Preserve cleanup obligations when migrating or changing limits.
+- **Embedded Rust applications:** update explicit `AppConfig`/`WindowConfig` struct literals for the new fields or use `..Default::default()`. Handle overload errors from `submit_event`; use `spawn_pipeline_tailer` for byte-budgeted file ingestion or `visit_log_file` for streaming replay. The bulk `replay_log_file` helper collects caller-owned events.
+- **Hub deployments:** upgrade Hub and nodes together to use capacity acknowledgements and retries. The wire protocol adds `PushAck.rejected_capacity` and `rejected_invalid`; requests are limited to 256 signals and 256 KiB. Vote/signature retention, per-entry voter limits, and subscription limits now apply.
+- **Source builds:** Rust 1.88 or newer is required. `custos --version` should report `custos 0.3.0`.
+
 
 ---
 
@@ -93,11 +98,41 @@ flowchart LR
 ```
 
 ### How the 3-Tier Pipeline Achieves Ultra-Low Cost
-1. **Benign static traffic is filtered at Tier 1 for $0**: Benign `200/304` static asset requests (`.css`, `.js`, `.png`, `.woff2`, `/healthz`), already-banned IPs, and obvious volumetric L1 floods are handled immediately in memory without ever calling an external API.
+1. **Benign static traffic is filtered at Tier 1 for $0**: Successful `GET`/`HEAD` static asset requests with no suspicious URI or User-Agent signals skip AI analysis, while still counting toward L1 flood limits. Set the flood threshold for total page traffic, including assets. Cached exploit signatures are checked before this shortcut.
 2. **Multi-Actor Compacted State Batching**: Only suspicious IP behavioral windows (e.g., `401/403` brute-force bursts, `404` path-enumeration spikes, SQLi/XSS/LFI probe tokens, or scanner User-Agents) are promoted to Tier 2. Custos packs up to **25 suspicious actors into a single `/v1/systemone` request** (~$0.00009 per 4-actor batch).
 3. **Conservative L1 Signature Learning**: High-confidence actor verdicts can cache exact known exploit targets such as `/.env` and `/.git/config`. Ordinary application routes, first samples without exploit evidence, and query-specific attacks never become route-wide signatures. Cached matches avoid additional AI calls.
 
+Window expiration runs during ingestion even while Jev is unavailable. Failed analysis batches remain available for retry; expired suspicious windows use a bounded backlog. If that backlog fills, the oldest expired evidence is dropped and counted in `custos_expired_evidence_dropped_total`.
+
+HTTP inspection decodes at most two percent-encoding layers and recognizes SQL comment/whitespace separators. Samples retain the highest-risk requests, including an excerpt around late attack indicators. Known credential parameters and Bearer/Basic values are redacted before samples are stored or sent to Jev. Missing answers, invalid classes, and out-of-range probabilities fail analysis and retain the batch for retry.
+
+Input limits are 64 KiB per log record, 8 KiB for the inspected path/query, 1 KiB for User-Agent, and 32 bytes for the method. Oversized HTTP fields are truncated before queuing and marked for analysis; oversized log records are discarded through their newline. Per-window samples are capped at 32 and distinct-path fingerprints at 1,024, including when larger counts are configured. `window.max_state_bytes` reserves space conservatively for active and expired windows and may reduce capacity below `max_tracked_ips`; it is not a total process memory limit. The minimum reservation is one active/expired window pair.
+
+Custos currently evaluates access-log metadata after a request completes. Bodies, cookies, raw protocol headers, and application authorization context are not inspected. Use application authorization and an upstream WAF for controls that must reject an initial exploit request.
+
 ---
+
+### Memory admission under sustained load
+
+`window.max_state_bytes` bounds window reservations. The `[memory]` settings separately bound retained bans/cleanup, ingestion, provider responses, and Hub state. They do not impose a total process RSS ceiling.
+
+- Active bans and pending firewall cleanup share `max_decisions` slots (10,000 by default). New bans fail at capacity; existing bans and cleanup obligations are preserved. Embedded HTTP admission and bouncer checks for unknown clients return `503` while the decision store is full. Cleanup frees slots only after success. Ban reasons are limited to 512 bytes and threat names to 64 bytes. Loading a journal that exceeds capacity or contains an oversized record fails explicitly; size limits apply during replay before parsing.
+- Ingestion reserves 12 KiB per queued/running event or outstanding HTTP permit against an 8 MiB default budget, with at most 1,024 channel slots. Public `submit_event` returns an overload error rather than accumulating waiting producers. CLI replay streams records through `visit_log_file` instead of collecting the log. The explicit bulk `replay_log_file` helper returns a caller-owned vector and scales with file size. File readers backpressure directly into this queue; the daemon has no intermediate event queue and supports at most 16 log sources. Reader batches target 64 KiB, plus at most one record. The legacy `spawn_log_tailer` API uses a caller-owned channel; size that channel explicitly or prefer `spawn_pipeline_tailer`.
+- Jev response bodies, including HTTP error bodies and chunked responses, stop at 256 KiB by default. Batches contain at most 64 actors. Invalid or oversized replies retain the pending analysis batch for retry.
+- Hub IP votes/promotions share 10,000 slots; signatures share 1,024 slots. Votes below quorum and signatures expire after one hour by default; promoted IPs keep their explicit expiry. Each entry has at most 64 voters, node identities are bounded, and signature targets are limited to 256 bytes. `PushAck.rejected_capacity` and `rejected_invalid` report refusals. The reconnecting client retains capacity-rejected batches for retry. Existing live deltas remain available to slow subscribers; history is bounded by live state.
+- Hub wire messages are limited to 256 KiB inbound and 4 MiB outbound. There are at most 16 intel subscriptions with a one-message buffer each; the HTTP bouncer API admits at most 16 response bodies at once. Saturated clients receive explicit overload errors. Local signature caches also have capacity and expiry limits.
+
+An existing journal must fit the configured decision and record limits before startup. Preserve the journal and its cleanup obligations when changing limits; a smaller limit does not silently discard records. Set a service/container memory limit and web-server connection/request limits for host isolation; application handlers, caller-owned data, networking, and allocator overhead are outside these retained-state budgets.
+
+The isolated stress test runs automatically with the regression suite. For longer runs:
+
+```sh
+CUSTOS_STRESS_SECONDS=60 cargo test --test ddos_stress -- --nocapture
+CUSTOS_STRESS_DEFAULTS=1 CUSTOS_STRESS_SECONDS=60 cargo test --test ddos_stress -- --nocapture
+```
+
+It simulates distinct attacking IPs, long URLs and headers, ban saturation, signature churn, Hub quorum/expiry, queue pressure, and failed analysis retries. It asserts per-component admission limits, Rust heap stability after warm-up, and process resident-memory high-water bounds. These are repeatable load profiles, not a universal memory ceiling for every deployment.
+
 
 ## 🚀 Quick Start
 
@@ -109,7 +144,7 @@ curl -fsSL https://raw.githubusercontent.com/george-amir/Custos/main/install.sh 
 
 #### Or Install Directly via Cargo (No `protoc` Required)
 ```bash
-cargo install --git https://github.com/george-amir/Custos.git --tag v0.2.0 --locked
+cargo install --git https://github.com/george-amir/Custos.git --tag v0.3.0 --locked
 ```
 
 ### 2. Zero-Config Setup & Run (`custos init`)
@@ -395,7 +430,7 @@ Because `custos` vendors its generated Protobuf/gRPC code in [`src/hub_proto.rs`
 ### Add to `Cargo.toml`
 ```toml
 [dependencies]
-custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.2.0" }
+custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.3.0" }
 ```
 
 ### Embed `custos_bouncer_middleware` in an Axum Router
@@ -466,7 +501,9 @@ Scrape `http://127.0.0.1:8085/metrics` with Prometheus, Grafana Agent, or Vector
 | Metric Name | Type | Description |
 | :--- | :--- | :--- |
 | `custos_events_processed_total` | `counter` | Total HTTP access log events ingested |
-| `custos_static_ignored_total` | `counter` | Benign static asset hits ignored at Tier 1 ($0 cost) |
+| `custos_static_ignored_total` | `counter` | Static hits skipped for AI analysis while counting toward flood limits |
+| `custos_capacity_dropped_total` | `counter` | Events rejected because active window capacity was reached |
+| `custos_expired_evidence_dropped_total` | `counter` | Oldest expired windows dropped when the evidence backlog filled |
 | `custos_l1_instant_bans_total` | `counter` | Instant bans triggered by L1 flood or cached validated exploit signatures |
 | `custos_windows_promoted_total` | `counter` | Suspicious IP windows promoted to TypeSafe Jev Tier 2 |
 | `custos_jev_batches_total` | `counter` | Total multi-actor batch requests sent to Jev `/v1/systemone` |
@@ -498,7 +535,16 @@ See [`config.example.toml`](config.example.toml) for a complete annotated config
 | `window.window_secs` | `15` | — | Sliding behavioral window duration per IP |
 | `window.flush_interval_ms` | `2500` | — | Interval between multi-actor Jev batch evaluations |
 | `window.l1_flood_threshold` | `120` | — | Instant L1 ban threshold (requests per window) |
-| `window.max_tracked_ips` | `50000` | — | Maximum concurrent IP windows tracked in RAM (anti-DDoS OOM cap) |
+| `window.max_tracked_ips` | `50000` | — | Upper bound on active IP windows, also limited by the state reservation budget |
+| `window.max_state_bytes` | `67108864` | — | Conservative reservation budget for active and expired window evidence (64 MiB) |
+| `memory.max_decisions` | `10000` | — | Combined retained ban and cleanup slots |
+| `memory.event_queue_bytes` | `8388608` | — | Ingestion reservation budget (8 MiB) |
+| `memory.event_queue_capacity` | `1024` | — | Maximum ingestion channel slots |
+| `memory.max_provider_response_bytes` | `262144` | — | Maximum Jev response body (256 KiB) |
+| `memory.hub_max_entries` | `10000` | — | Hub IP vote and promotion slots |
+| `memory.max_signatures` | `1024` | — | Hub and local cache signature slots |
+| `memory.hub_retention_secs` | `3600` | — | Unpromoted vote and signature retention |
+| `memory.hub_max_streams` | `16` | — | Simultaneous Hub intel subscriptions |
 | `jev.endpoint` | `"https://api.typesafe.ai/v1/systemone"` | — | TypeSafe Jev System-1 API endpoint |
 | `jev.api_key` | `""` | `TYPESAFE_API_KEY` | TypeSafe AI Bearer API key |
 | `jev.max_actors_per_batch` | `25` | — | Max suspicious actors packed into a single `/v1/systemone` call |

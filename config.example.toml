@@ -29,6 +29,9 @@ min_suspicion_score = 2
 max_sample_requests = 10
 # Hard cap on concurrently tracked IP windows in memory to prevent spoofed-IP DDoS OOM
 max_tracked_ips = 50000
+# Conservative active + expired window reservation budget (64 MiB).
+# Effective IP capacity is also limited by this budget and configured evidence limits.
+max_state_bytes = 67108864
 
 [jev]
 endpoint = "https://api.typesafe.ai/v1/systemone"
@@ -74,3 +77,16 @@ quorum_min_nodes = 1
 # [hub.node_tokens]
 # edge_eu = "replace-with-unique-secret"
 # edge_us = "replace-with-another-unique-secret"
+
+# Retained library state and ingestion admission limits. Not a process RSS limit.
+[memory]
+# Active bans AND pending cleanup share these slots. Existing entries are never evicted.
+max_decisions = 10000
+# A conservative 12 KiB reservation covers every queued/running event or HTTP permit.
+event_queue_bytes = 8388608
+event_queue_capacity = 1024
+max_provider_response_bytes = 262144
+hub_max_entries = 10000
+max_signatures = 1024
+hub_retention_secs = 3600
+hub_max_streams = 16

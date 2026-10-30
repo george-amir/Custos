@@ -35,6 +35,8 @@ message SignalBatch {
 }
 
 message PushAck {
+  uint32 rejected_capacity = 5;
+  uint32 rejected_invalid = 6;
   uint32 accepted_ips = 1;
   uint32 accepted_signatures = 2;
   uint32 rejected_canary = 3;

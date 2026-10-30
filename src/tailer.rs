@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -24,6 +24,41 @@ pub struct AccessLogEvent {
     pub user_agent: String,
 }
 
+/// Limits apply before buffering or retaining attacker-controlled HTTP fields.
+pub const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
+pub const MAX_URI_BYTES: usize = 8 * 1024;
+pub const MAX_UA_BYTES: usize = 1024;
+pub const MAX_METHOD_BYTES: usize = 32;
+
+pub(crate) fn bounded_str(raw: &str, max: usize) -> &str {
+    let mut end = raw.len().min(max);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
+pub(crate) fn bound_event(mut ev: AccessLogEvent) -> (AccessLogEvent, bool) {
+    fn trim(value: &mut String, max: usize) -> bool {
+        let end = bounded_str(value, max).len();
+        if end == value.len() {
+            if value.capacity() > max {
+                value.shrink_to_fit();
+            }
+            return false;
+        }
+        value.truncate(end);
+        value.shrink_to_fit();
+        true
+    }
+    let mut oversized = trim(&mut ev.path, MAX_URI_BYTES);
+    oversized |= trim(&mut ev.query, MAX_URI_BYTES.saturating_sub(ev.path.len()));
+    oversized |= trim(&mut ev.user_agent, MAX_UA_BYTES);
+    oversized |= trim(&mut ev.method, MAX_METHOD_BYTES);
+    trim(&mut ev.referer, 2048);
+    (ev, oversized)
+}
+
 static NGINX_COMBINED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+"(?P<method>[A-Z]+)\s+(?P<uri>\S+)\s+[^"]*"\s+(?P<status>\d{3})\s+(?P<bytes>\d+|-)\s+"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)""#,
@@ -33,6 +68,9 @@ static NGINX_COMBINED_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Parses a single line according to the configured `LogFormat`.
 pub fn parse_log_line(line: &str, format: LogFormat) -> Option<AccessLogEvent> {
+    if line.len() > MAX_LOG_RECORD_BYTES {
+        return None;
+    }
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -184,23 +222,53 @@ fn parse_json_log(line: &str) -> Option<AccessLogEvent> {
 
 /// Reads an entire log file from beginning to end for deterministic replay/testing.
 pub fn replay_log_file(path: &Path, format: LogFormat) -> Result<Vec<AccessLogEvent>> {
+    let mut events = Vec::new();
+    visit_log_file(path, format, |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    Ok(events)
+}
+
+/// Stream bounded records without retaining the file; stop immediately on callback errors.
+pub fn visit_log_file(
+    path: &Path,
+    format: LogFormat,
+    mut visit: impl FnMut(AccessLogEvent) -> Result<()>,
+) -> Result<usize> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open log file for replay: {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut events = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(ev) = parse_log_line(&line, format) {
-            events.push(ev);
+    let mut count = 0;
+    let mut reader = reader;
+    let mut discarding = false;
+    loop {
+        let mut record = Vec::new();
+        let bytes = (&mut reader)
+            .take((MAX_LOG_RECORD_BYTES + 1) as u64)
+            .read_until(b'\n', &mut record)?;
+        if bytes == 0 {
+            break;
+        }
+        let oversized = discarding || bytes > MAX_LOG_RECORD_BYTES;
+        discarding = oversized && !record.ends_with(b"\n");
+        if !oversized
+            && let Ok(line) = std::str::from_utf8(&record)
+            && let Some(ev) = parse_log_line(line, format)
+        {
+            visit(ev)?;
+            count += 1;
         }
     }
-    Ok(events)
+    Ok(count)
 }
 
 #[derive(Default)]
 struct TailCursor {
     offset: u64,
     identity: Option<(u64, u64)>,
+    discarding_oversized: bool,
+    full_batch: bool,
 }
 
 #[cfg(unix)]
@@ -266,7 +334,10 @@ fn read_available(
     let len = file.metadata()?.len();
     match cursor.identity {
         None => cursor.offset = if from_start { 0 } else { len },
-        Some(previous) if previous != identity || len < cursor.offset => cursor.offset = 0,
+        Some(previous) if previous != identity || len < cursor.offset => {
+            cursor.offset = 0;
+            cursor.discarding_oversized = false;
+        }
         _ => {}
     }
     cursor.identity = Some(identity);
@@ -281,20 +352,40 @@ fn read_records(
     reader: &mut impl BufRead,
 ) -> Result<Vec<AccessLogEvent>> {
     let mut events = Vec::new();
+    cursor.full_batch = true;
     // Limit each filesystem operation so cancellation/backpressure stays responsive.
+    let mut batch_bytes = 0;
     for _ in 0..256 {
+        // Stop before the next record; at most one 64 KiB record can exceed this target.
+        if batch_bytes >= 64 * 1024 {
+            break;
+        }
         let mut record = Vec::new();
-        let bytes = match reader.read_until(b'\n', &mut record) {
+        let bytes = match (&mut *reader)
+            .take((MAX_LOG_RECORD_BYTES + 1) as u64)
+            .read_until(b'\n', &mut record)
+        {
             Ok(bytes) => bytes,
             Err(error) if events.is_empty() => return Err(error.into()),
             Err(error) => {
                 // Already committed records must still reach the consumer. The
                 // failed record's offset is unchanged, so the next poll retries it.
+                cursor.full_batch = false;
                 warn!(path = %source.path.display(), offset = cursor.offset, %error, "Read interrupted; delivering complete records before retry");
                 break;
             }
         };
-        if bytes == 0 || !record.ends_with(b"\n") {
+        if bytes == 0 {
+            cursor.full_batch = false;
+            break;
+        }
+        if cursor.discarding_oversized || bytes > MAX_LOG_RECORD_BYTES {
+            cursor.offset += bytes as u64;
+            cursor.discarding_oversized = !record.ends_with(b"\n");
+            continue;
+        }
+        if !record.ends_with(b"\n") {
+            cursor.full_batch = false;
             break;
         }
         cursor.offset += bytes as u64;
@@ -303,6 +394,7 @@ fn read_records(
             continue;
         };
         if let Some(event) = parse_log_line(line, source.format) {
+            batch_bytes += bytes;
             events.push(event);
         } else if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
             warn!(path = %source.path.display(), offset = cursor.offset, "Skipped malformed access log record");
@@ -317,10 +409,31 @@ pub fn spawn_log_tailer(
     tx: mpsc::Sender<AccessLogEvent>,
     read_from_start: bool,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_reader(source, LogSink::Channel(tx), read_from_start)
+}
+
+pub fn spawn_pipeline_tailer(
+    source: LogSourceConfig,
+    pipeline: crate::SecurityPipeline,
+    read_from_start: bool,
+) -> tokio::task::JoinHandle<()> {
+    spawn_reader(source, LogSink::Pipeline(pipeline), read_from_start)
+}
+
+enum LogSink {
+    Channel(mpsc::Sender<AccessLogEvent>),
+    Pipeline(crate::SecurityPipeline),
+}
+
+fn spawn_reader(
+    source: LogSourceConfig,
+    sink: LogSink,
+    read_from_start: bool,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cursor = TailCursor::default();
         loop {
-            if tx.is_closed() {
+            if matches!(&sink, LogSink::Channel(tx) if tx.is_closed()) {
                 return;
             }
             let input = source.clone();
@@ -340,9 +453,15 @@ pub fn spawn_log_tailer(
             let mut full = false;
             match result {
                 Ok(events) => {
-                    full = events.len() == 256;
+                    full = cursor.full_batch;
                     for event in events {
-                        if tx.send(event).await.is_err() {
+                        let sent = match &sink {
+                            LogSink::Channel(tx) => {
+                                tx.send(event).await.map_err(anyhow::Error::from)
+                            }
+                            LogSink::Pipeline(pipeline) => pipeline.submit_log_event(event).await,
+                        };
+                        if sent.is_err() {
                             return;
                         }
                     }

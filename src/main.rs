@@ -13,7 +13,7 @@ use custos::hub::{
 };
 use custos::jev::JevBatchAnalyzer;
 use custos::store::{BanDecision, DecisionStore};
-use custos::tailer::{replay_log_file, spawn_log_tailer};
+use custos::tailer::visit_log_file;
 use custos::window::SlidingWindowEngine;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -450,7 +450,7 @@ async fn run_hub_server(listen: &str, quorum: usize, cfg: &AppConfig) -> Result<
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("Invalid gRPC listen socket address: {listen}"))?;
-    let engine = Arc::new(HubEngine::new(quorum));
+    let engine = Arc::new(HubEngine::with_limits(quorum, cfg.memory.clone()));
     let svc = CustosHubGrpcService::with_auth(
         engine,
         cfg.hub.api_token.clone(),
@@ -472,15 +472,28 @@ async fn run_hub_server(listen: &str, quorum: usize, cfg: &AppConfig) -> Result<
 }
 
 async fn cmd_hub_sync(cfg: AppConfig, hub_endpoint: &str, since_seq: u64) -> Result<()> {
-    let store = Arc::new(DecisionStore::open(
+    let store = Arc::new(DecisionStore::open_with_limit(
         cfg.daemon.decisions_file.clone(),
         cfg.daemon.default_ban_ttl_secs,
+        cfg.memory.max_decisions,
     )?);
-    let window = Arc::new(SlidingWindowEngine::new(cfg.window.clone()));
-    let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), true)?);
+    let window = Arc::new(SlidingWindowEngine::with_limits(
+        cfg.window.clone(),
+        cfg.memory.clone(),
+    ));
+    let jev = Arc::new(JevBatchAnalyzer::with_response_limit(
+        cfg.jev.clone(),
+        true,
+        cfg.memory.max_provider_response_bytes,
+    )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())?;
+    let pipeline = SecurityPipeline::new_with_limits(
+        store.clone(),
+        window.clone(),
+        jev.clone(),
+        firewall.clone(),
+        cfg.memory.clone(),
+    )?;
 
     let (latest_seq, ips_applied, sigs_applied) = pull_and_apply_via_grpc(
         hub_endpoint,
@@ -513,15 +526,28 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
         info!("No TYPESAFE_API_KEY configured; starting JevBatchAnalyzer in --mock-jev mode");
     }
 
-    let store = Arc::new(DecisionStore::open(
+    let store = Arc::new(DecisionStore::open_with_limit(
         cfg.daemon.decisions_file.clone(),
         cfg.daemon.default_ban_ttl_secs,
+        cfg.memory.max_decisions,
     )?);
-    let window = Arc::new(SlidingWindowEngine::new(cfg.window.clone()));
-    let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), use_mock)?);
+    let window = Arc::new(SlidingWindowEngine::with_limits(
+        cfg.window.clone(),
+        cfg.memory.clone(),
+    ));
+    let jev = Arc::new(JevBatchAnalyzer::with_response_limit(
+        cfg.jev.clone(),
+        use_mock,
+        cfg.memory.max_provider_response_bytes,
+    )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())?;
+    let pipeline = SecurityPipeline::new_with_limits(
+        store.clone(),
+        window.clone(),
+        jev.clone(),
+        firewall.clone(),
+        cfg.memory.clone(),
+    )?;
 
     // Startup initialization already reconciles durable decisions. Retry failures later.
     let sweep_pipeline = pipeline.clone();
@@ -544,7 +570,7 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
         }
     });
 
-    let (hub_tx, hub_rx) = mpsc::channel(256);
+    let (hub_tx, hub_rx) = mpsc::channel(1);
     if cfg.hub.enabled {
         if cfg.hub.api_token.trim().is_empty() {
             anyhow::bail!("Hub sync requires hub.api_token or CUSTOS_HUB_TOKEN");
@@ -562,22 +588,19 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
         });
     }
 
-    let (tx, mut rx) = mpsc::channel(8192);
+    anyhow::ensure!(
+        cfg.logs.len() <= 16,
+        "At most 16 log sources may be tailed per process"
+    );
     let mut tailer_tasks = Vec::new();
     for source in &cfg.logs {
         info!(path = %source.path.display(), format = ?source.format, "Tailing log source");
-        tailer_tasks.push(spawn_log_tailer(source.clone(), tx.clone(), from_start));
+        tailer_tasks.push(custos::tailer::spawn_pipeline_tailer(
+            source.clone(),
+            pipeline.clone(),
+            from_start,
+        ));
     }
-
-    drop(tx);
-    let ingest_pipeline = pipeline.clone();
-    let ingest_task = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let Err(err) = ingest_pipeline.submit_event(ev).await {
-                error!(error = %err, "Failed to process log event");
-            }
-        }
-    });
 
     let flush_pipeline = pipeline.clone();
     let flush_ms = cfg.window.flush_interval_ms.max(500);
@@ -598,13 +621,17 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
             match flush_pipeline.flush_and_analyze(false).await {
                 Ok(verdicts) => {
                     if hub_enabled && !verdicts.is_empty() {
-                        let sig_batch = build_signal_batch_from_verdicts(
-                            &node_id,
-                            &api_token,
-                            &verdicts,
-                            default_ttl,
-                        );
-                        let _ = hub_tx.send(sig_batch).await;
+                        for chunk in verdicts.chunks(custos::limits::MAX_HUB_BATCH) {
+                            let sig_batch = build_signal_batch_from_verdicts(
+                                &node_id,
+                                &api_token,
+                                chunk,
+                                default_ttl,
+                            );
+                            if hub_tx.send(sig_batch).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
                 Err(err) => error!(error = %err, "Jev batch flush failed"),
@@ -644,7 +671,6 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
             for task in tailer_tasks {
                 let _ = task.await;
             }
-            let _ = ingest_task.await;
             // Finish any in-flight batch before the final forced drain.
             let _ = stop_flush.send(());
             let _ = flush_task.await;
@@ -667,29 +693,38 @@ async fn run_replay(
     mock_jev: bool,
 ) -> Result<()> {
     let use_mock = mock_jev || cfg.jev.api_key.trim().is_empty();
-    let store = Arc::new(DecisionStore::open(
+    let store = Arc::new(DecisionStore::open_with_limit(
         cfg.daemon.decisions_file.clone(),
         cfg.daemon.default_ban_ttl_secs,
+        cfg.memory.max_decisions,
     )?);
-    let window = Arc::new(SlidingWindowEngine::new(cfg.window.clone()));
-    let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), use_mock)?);
+    let window = Arc::new(SlidingWindowEngine::with_limits(
+        cfg.window.clone(),
+        cfg.memory.clone(),
+    ));
+    let jev = Arc::new(JevBatchAnalyzer::with_response_limit(
+        cfg.jev.clone(),
+        use_mock,
+        cfg.memory.max_provider_response_bytes,
+    )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())?;
+    let pipeline = SecurityPipeline::new_with_limits(
+        store.clone(),
+        window.clone(),
+        jev.clone(),
+        firewall.clone(),
+        cfg.memory.clone(),
+    )?;
 
-    let events = replay_log_file(log_path, format)?;
+    let event_count = visit_log_file(log_path, format, |ev| pipeline.process_event(&ev))?;
     println!(
         "=== Custos Replay: {} ({} parsed events, mode={}, firewall={} [dry_run={}]) ===",
         log_path.display(),
-        events.len(),
+        event_count,
         if use_mock { "mock-jev" } else { "live-jev" },
         firewall.resolved_backend().as_str(),
         firewall.is_dry_run()
     );
-
-    for ev in &events {
-        pipeline.process_event(ev)?;
-    }
 
     let verdicts = pipeline.flush_and_analyze(true).await?;
 
@@ -776,9 +811,10 @@ async fn run_replay(
 }
 
 fn cmd_firewall(mut cfg: AppConfig, backend_arg: &str, live: bool) -> Result<()> {
-    let store = DecisionStore::open(
+    let store = DecisionStore::open_with_limit(
         cfg.daemon.decisions_file.clone(),
         cfg.daemon.default_ban_ttl_secs,
+        cfg.memory.max_decisions,
     )?;
     let active = store.list_active();
     let batch_entries: Vec<(IpAddr, u64)> = active
@@ -846,9 +882,10 @@ async fn cmd_decisions(api_url: &str, cfg: &AppConfig) -> Result<()> {
         print_decisions(&decisions);
         return Ok(());
     }
-    let store = DecisionStore::open(
+    let store = DecisionStore::open_with_limit(
         cfg.daemon.decisions_file.clone(),
         cfg.daemon.default_ban_ttl_secs,
+        cfg.memory.max_decisions,
     )?;
     print_decisions(&store.list_active());
     Ok(())

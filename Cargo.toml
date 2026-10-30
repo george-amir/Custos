@@ -1,6 +1,6 @@
 [package]
 name = "custos"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Custos — Open-source behavioral security engine, bouncer, and gRPC threat-intelligence hub powered by TypeSafe AI's Jev model"
@@ -35,6 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3.15"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -1,9 +1,10 @@
+use crate::limits::{MAX_REASON_BYTES, MAX_THREAT_BYTES, MemoryLimits};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -52,16 +53,33 @@ pub struct DecisionStore {
     pending_cleanup: DashMap<IpAddr, ()>,
     persistence_path: PathBuf,
     default_ttl_secs: u64,
+    max_decisions: usize,
+    pub capacity_rejected: AtomicU64,
     mutation_lock: Mutex<()>,
 }
 
 impl DecisionStore {
     pub fn open(persistence_path: PathBuf, default_ttl_secs: u64) -> Result<Self> {
+        Self::open_with_limit(
+            persistence_path,
+            default_ttl_secs,
+            MemoryLimits::default().max_decisions,
+        )
+    }
+
+    pub fn open_with_limit(
+        persistence_path: PathBuf,
+        default_ttl_secs: u64,
+        max_decisions: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(max_decisions > 0, "Decision capacity must be positive");
         let store = Self {
             active_bans: DashMap::new(),
             pending_cleanup: DashMap::new(),
             persistence_path,
             default_ttl_secs,
+            max_decisions,
+            capacity_rejected: AtomicU64::new(0),
             mutation_lock: Mutex::new(()),
         };
         store.load_existing()?;
@@ -72,32 +90,42 @@ impl DecisionStore {
         if !self.persistence_path.exists() {
             return Ok(());
         }
-        let reader = BufReader::new(File::open(&self.persistence_path).with_context(|| {
+        let mut reader = BufReader::new(File::open(&self.persistence_path).with_context(|| {
             format!(
                 "Failed to open persistence file {}",
                 self.persistence_path.display()
             )
         })?);
-        for (index, line) in reader.lines().enumerate() {
-            let line = line?;
+        let mut index = 0;
+        loop {
+            let mut bytes = Vec::new();
+            if (&mut reader).take(4097).read_until(b'\n', &mut bytes)? == 0 {
+                break;
+            }
+            anyhow::ensure!(bytes.len() <= 4096, "Decision journal record exceeds 4 KiB");
+            let line = std::str::from_utf8(&bytes)?;
+            index += 1;
             if line.trim().is_empty() {
                 continue;
             }
             // Existing JSONL BanDecision records remain backwards compatible.
-            if let Ok(decision) = serde_json::from_str::<BanDecision>(&line) {
+            if let Ok(decision) = serde_json::from_str::<BanDecision>(line) {
+                self.validate_metadata(&decision.threat_class, &decision.reason)?;
+                self.admit(&decision.ip)?;
                 self.pending_cleanup.remove(&decision.ip);
                 self.active_bans.insert(decision.ip, decision);
                 continue;
             }
-            let operation: JournalOperation = serde_json::from_str(&line).with_context(|| {
+            let operation: JournalOperation = serde_json::from_str(line).with_context(|| {
                 format!(
                     "Invalid decision journal record at {}:{}",
                     self.persistence_path.display(),
-                    index + 1
+                    index
                 )
             })?;
             match operation {
                 JournalOperation::Remove { ip } => {
+                    self.admit(&ip)?;
                     self.active_bans.remove(&ip);
                     self.pending_cleanup.insert(ip, ());
                 }
@@ -128,6 +156,7 @@ impl DecisionStore {
         reason: String,
         custom_ttl_secs: Option<u64>,
     ) -> Result<BanDecision> {
+        self.validate_metadata(&threat_class, &reason)?;
         let now = Utc::now();
         let ttl = custom_ttl_secs.unwrap_or(self.default_ttl_secs).max(1);
         let duration = i64::try_from(ttl)
@@ -150,6 +179,7 @@ impl DecisionStore {
             .mutation_lock
             .lock()
             .map_err(|_| anyhow!("Decision journal lock poisoned"))?;
+        self.admit(&ip)?;
         self.append_record(&decision)?;
         self.pending_cleanup.remove(&ip);
         self.active_bans.insert(ip, decision.clone());
@@ -169,6 +199,35 @@ impl DecisionStore {
         self.active_bans.remove(ip);
         self.pending_cleanup.insert(*ip, ());
         Ok(true)
+    }
+
+    pub fn retained_count(&self) -> usize {
+        self.active_bans.len() + self.pending_cleanup.len()
+    }
+
+    pub fn is_at_capacity(&self) -> bool {
+        self.retained_count() >= self.max_decisions
+    }
+
+    fn admit(&self, ip: &IpAddr) -> Result<()> {
+        if !self.active_bans.contains_key(ip)
+            && !self.pending_cleanup.contains_key(ip)
+            && self.is_at_capacity()
+        {
+            self.capacity_rejected.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!(
+                "Decision capacity reached; existing bans and cleanup obligations retained"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_metadata(&self, threat: &str, reason: &str) -> Result<()> {
+        anyhow::ensure!(
+            threat.len() <= MAX_THREAT_BYTES && reason.len() <= MAX_REASON_BYTES,
+            "Decision metadata exceeds its byte limit"
+        );
+        Ok(())
     }
 
     pub fn list_active(&self) -> Vec<BanDecision> {

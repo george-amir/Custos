@@ -5,6 +5,7 @@ pub mod hub;
 #[allow(clippy::all)]
 pub mod hub_proto;
 pub mod jev;
+pub mod limits;
 pub mod middleware;
 pub mod sanitizer;
 pub mod service;
@@ -84,15 +85,25 @@ impl CustosBuilder {
     }
 
     pub fn build(self) -> Result<SecurityPipeline> {
+        self.config.memory.validate()?;
+        let limits = self.config.memory;
         let use_mock = self.mock_jev || self.config.jev.api_key.trim().is_empty();
-        let store = Arc::new(DecisionStore::open(
+        let store = Arc::new(DecisionStore::open_with_limit(
             self.config.daemon.decisions_file,
             self.config.daemon.default_ban_ttl_secs,
+            limits.max_decisions,
         )?);
-        let window = Arc::new(SlidingWindowEngine::new(self.config.window));
-        let jev = Arc::new(JevBatchAnalyzer::new(self.config.jev, use_mock)?);
+        let window = Arc::new(SlidingWindowEngine::with_limits(
+            self.config.window,
+            limits.clone(),
+        ));
+        let jev = Arc::new(JevBatchAnalyzer::with_response_limit(
+            self.config.jev,
+            use_mock,
+            limits.max_provider_response_bytes,
+        )?);
         let firewall = Arc::new(FirewallBouncer::new(self.config.firewall));
-        let mut pipeline = SecurityPipeline::new(store, window, jev, firewall)?;
+        let mut pipeline = SecurityPipeline::new_with_limits(store, window, jev, firewall, limits)?;
         pipeline.trusted_proxies = Arc::new(self.config.daemon.trusted_proxies);
         Ok(pipeline)
     }
@@ -104,14 +115,19 @@ impl CustosBuilder {
 /// 3. Flushes suspicious IP windows in batches to `JevBatchAnalyzer` (`/v1/systemone`),
 ///    updating `DecisionStore`, enforcing OS firewall rules, and caching high-confidence attack signatures.
 enum IngestionMessage {
-    Event(AccessLogEvent),
+    Event(AccessLogEvent, bool, tokio::sync::OwnedSemaphorePermit),
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
-pub struct EventPermit(tokio::sync::mpsc::OwnedPermit<IngestionMessage>);
+pub struct EventPermit(
+    tokio::sync::mpsc::OwnedPermit<IngestionMessage>,
+    tokio::sync::OwnedSemaphorePermit,
+);
 impl EventPermit {
     pub fn send(self, event: AccessLogEvent) {
-        self.0.send(IngestionMessage::Event(event));
+        let (event, oversized) = tailer::bound_event(event);
+        self.0
+            .send(IngestionMessage::Event(event, oversized, self.1));
     }
 }
 
@@ -123,6 +139,8 @@ pub struct SecurityPipeline {
     pub firewall: Arc<FirewallBouncer>,
     pub trusted_proxies: Arc<Vec<IpAddr>>,
     enforcement: Arc<Mutex<()>>,
+    queue_budget: Arc<tokio::sync::Semaphore>,
+    pub queue_rejected: Arc<std::sync::atomic::AtomicU64>,
     pending: Arc<tokio::sync::Mutex<VecDeque<ActorStateSummary>>>,
     ingestion: Option<tokio::sync::mpsc::Sender<IngestionMessage>>,
 }
@@ -138,6 +156,23 @@ impl SecurityPipeline {
         jev: Arc<JevBatchAnalyzer>,
         firewall: Arc<FirewallBouncer>,
     ) -> Result<Self> {
+        Self::new_with_limits(
+            store,
+            window,
+            jev,
+            firewall,
+            limits::MemoryLimits::default(),
+        )
+    }
+
+    pub fn new_with_limits(
+        store: Arc<DecisionStore>,
+        window: Arc<SlidingWindowEngine>,
+        jev: Arc<JevBatchAnalyzer>,
+        firewall: Arc<FirewallBouncer>,
+        limits: limits::MemoryLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
         firewall.init_backend()?;
         let mut pipeline = Self {
             store,
@@ -146,11 +181,13 @@ impl SecurityPipeline {
             firewall,
             trusted_proxies: Arc::new(Vec::new()),
             enforcement: Arc::new(Mutex::new(())),
+            queue_budget: Arc::new(tokio::sync::Semaphore::new(limits.event_queue_bytes)),
+            queue_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             ingestion: None,
         };
         pipeline.reconcile_firewall()?;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8192);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(limits.event_queue_capacity);
         // The worker owns no sender, so dropping all public pipelines closes it.
         let worker = pipeline.clone();
         std::thread::Builder::new()
@@ -158,8 +195,8 @@ impl SecurityPipeline {
             .spawn(move || {
                 while let Some(message) = rx.blocking_recv() {
                     match message {
-                        IngestionMessage::Event(event) => {
-                            if let Err(error) = worker.process_event(&event) {
+                        IngestionMessage::Event(event, oversized, _memory) => {
+                            if let Err(error) = worker.process_event_bounded(&event, oversized) {
                                 warn!(%error, "Failed to ingest queued request");
                             }
                         }
@@ -181,22 +218,53 @@ impl SecurityPipeline {
 
     /// Reserve bounded ingestion capacity before executing an HTTP handler.
     pub fn reserve_event(&self) -> Result<EventPermit> {
-        self.ingestion
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Ingestion worker unavailable"))?
-            .clone()
-            .try_reserve_owned()
-            .map(EventPermit)
-            .map_err(|e| anyhow::anyhow!("Ingestion unavailable: {e}"))
+        if self.store.is_at_capacity() {
+            anyhow::bail!("Decision capacity reached");
+        }
+        let result = (|| {
+            let memory = self
+                .queue_budget
+                .clone()
+                .try_acquire_many_owned(limits::EVENT_RESERVATION_BYTES as u32)?;
+            let slot = self
+                .ingestion
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Ingestion unavailable"))?
+                .clone()
+                .try_reserve_owned()?;
+            Ok(EventPermit(slot, memory))
+        })();
+        if result.is_err() {
+            self.queue_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
+    /// Nonblocking admission: overload returns an error instead of retaining waiting producers.
     pub async fn submit_event(&self, event: AccessLogEvent) -> Result<()> {
+        self.reserve_event()?.send(event);
+        Ok(())
+    }
+
+    /// File readers backpressure on the original file, holding one bounded read batch.
+    pub(crate) async fn submit_log_event(&self, event: AccessLogEvent) -> Result<()> {
+        let (event, oversized) = tailer::bound_event(event);
+        let memory = self
+            .queue_budget
+            .clone()
+            .acquire_many_owned(limits::EVENT_RESERVATION_BYTES as u32)
+            .await?;
         self.ingestion
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Ingestion unavailable"))?
-            .send(IngestionMessage::Event(event))
-            .await
-            .map_err(|e| anyhow::anyhow!("Ingestion worker stopped: {e}"))
+            .send(IngestionMessage::Event(event, oversized, memory))
+            .await?;
+        Ok(())
+    }
+
+    pub fn available_queue_bytes(&self) -> usize {
+        self.queue_budget.available_permits()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -262,10 +330,14 @@ impl SecurityPipeline {
     }
 
     pub fn process_event(&self, ev: &AccessLogEvent) -> Result<()> {
+        self.process_event_bounded(ev, false)
+    }
+
+    fn process_event_bounded(&self, ev: &AccessLogEvent, oversized: bool) -> Result<()> {
         if self.store.check_ip(&ev.client_ip).is_some() {
             return Ok(());
         }
-        match self.window.ingest(ev) {
+        match self.window.ingest_bounded(ev, oversized) {
             L1Disposition::IgnoredStatic | L1Disposition::Buffered { .. } => {}
             L1Disposition::CapacityExceeded => anyhow::bail!("IP window capacity reached"),
             L1Disposition::InstantBan {

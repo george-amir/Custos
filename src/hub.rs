@@ -1,9 +1,11 @@
 pub use crate::hub_proto as proto;
 
 use crate::jev::ActorVerdict;
+use crate::limits::{MAX_HUB_BATCH, MAX_HUB_VOTERS, MAX_SIGNATURE_BYTES, MemoryLimits};
 use crate::store::DecisionSource;
 use crate::{SecurityPipeline, proven_signature_for_verdict};
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use proto::custos_hub_service_client::CustosHubServiceClient;
 use proto::custos_hub_service_server::{CustosHubService, CustosHubServiceServer};
@@ -145,28 +147,37 @@ impl DeltaEntry {
 /// State and its cursor are committed under one lock. A published cursor never
 /// refers to an entry that a reader could not have observed.
 #[derive(Default)]
+struct Votes {
+    nodes: HashSet<String>,
+    expires: i64,
+}
+
+#[derive(Default)]
 struct HubState {
     latest_seq: u64,
-    ip_voters: HashMap<IpAddr, HashSet<String>>,
+    last_expire: i64,
+    ip_voters: HashMap<IpAddr, Votes>,
     promoted_ips: HashMap<IpAddr, i64>,
-    sig_voters: HashMap<(String, String), HashSet<String>>,
-    promoted_sigs: HashSet<(String, String)>,
+    sig_voters: HashMap<(String, String), Votes>,
+    promoted_sigs: HashMap<(String, String), i64>,
     delta_log: Vec<DeltaEntry>,
 }
 
 impl HubState {
     fn expire(&mut self, now: i64) {
-        self.promoted_ips.retain(|ip, expiry| {
-            if *expiry <= now {
-                self.ip_voters.remove(ip);
-                false
-            } else {
-                true
-            }
-        });
+        if self.last_expire == now {
+            return;
+        }
+        self.last_expire = now;
+        self.promoted_ips.retain(|_, expiry| *expiry > now);
+        self.promoted_sigs.retain(|_, expiry| *expiry > now);
+        self.ip_voters.retain(|_, votes| votes.expires > now);
+        self.sig_voters.retain(|_, votes| votes.expires > now);
         self.delta_log.retain(|entry| match entry {
             DeltaEntry::Ip(delta) => delta.expires_at_unix_secs > now,
-            DeltaEntry::Signature(_) => true,
+            DeltaEntry::Signature(delta) => self
+                .promoted_sigs
+                .contains_key(&(delta.method.clone(), delta.path_prefix.clone())),
         });
     }
 }
@@ -175,6 +186,8 @@ impl HubState {
 /// node identity; network callers are authenticated by CustosHubGrpcService.
 pub struct HubEngine {
     quorum_min_nodes: usize,
+    limits: MemoryLimits,
+    pub capacity_rejected: AtomicU64,
     state: Mutex<HubState>,
     broadcaster: broadcast::Sender<HubDeltaBatch>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
@@ -190,9 +203,27 @@ impl HubEngine {
 
     /// Clock injection permits deterministic expiry checks by embedders and tests.
     pub fn with_clock(quorum_min_nodes: usize, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
-        let (broadcaster, _) = broadcast::channel(1024);
+        Self::with_limits_and_clock(quorum_min_nodes, MemoryLimits::default(), clock)
+    }
+
+    pub fn with_limits(quorum_min_nodes: usize, limits: MemoryLimits) -> Self {
+        Self::with_limits_and_clock(
+            quorum_min_nodes,
+            limits,
+            Arc::new(|| chrono::Utc::now().timestamp()),
+        )
+    }
+
+    pub fn with_limits_and_clock(
+        quorum_min_nodes: usize,
+        limits: MemoryLimits,
+        clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        let (broadcaster, _) = broadcast::channel(16);
         Self {
             quorum_min_nodes: quorum_min_nodes.max(1),
+            limits,
+            capacity_rejected: AtomicU64::new(0),
             state: Mutex::new(HubState::default()),
             broadcaster,
             clock,
@@ -215,6 +246,13 @@ impl HubEngine {
         let mut state = self.state.lock().expect("Hub state lock poisoned");
         state.expire(now);
         let mut ack = PushAck::default();
+        if validate_batch(&batch).is_err() {
+            ack.rejected_invalid = 1;
+            ack.latest_seq = state.latest_seq;
+            return ack;
+        }
+        let vote_expiry =
+            now.saturating_add(self.limits.hub_retention_secs.min(i64::MAX as u64) as i64);
         let mut ip_deltas = Vec::new();
         let mut signature_deltas = Vec::new();
         for signal in batch.ip_signals {
@@ -225,13 +263,27 @@ impl HubEngine {
                 ack.rejected_canary += 1;
                 continue;
             }
-            ack.accepted_ips += 1;
             if state.promoted_ips.contains_key(&ip) {
+                ack.accepted_ips += 1;
                 continue;
             }
-            let voters = state.ip_voters.entry(ip).or_default();
-            voters.insert(batch.node_id.clone());
-            if voters.len() >= self.quorum_min_nodes {
+            if !state.ip_voters.contains_key(&ip)
+                && state.ip_voters.len() + state.promoted_ips.len() >= self.limits.hub_max_entries
+            {
+                ack.rejected_capacity += 1;
+                continue;
+            }
+            let voters = state.ip_voters.entry(ip).or_insert_with(|| Votes {
+                nodes: HashSet::new(),
+                expires: vote_expiry,
+            });
+            if !voters.nodes.contains(&batch.node_id) && voters.nodes.len() >= MAX_HUB_VOTERS {
+                ack.rejected_capacity += 1;
+                continue;
+            }
+            voters.nodes.insert(batch.node_id.clone());
+            ack.accepted_ips += 1;
+            if voters.nodes.len() >= self.quorum_min_nodes {
                 state.latest_seq += 1;
                 let ttl_secs = signal.suggested_ttl_secs.clamp(1, 86400);
                 let expires_at_unix_secs = now.saturating_add(i64::from(ttl_secs));
@@ -244,6 +296,7 @@ impl HubEngine {
                     ttl_secs,
                     expires_at_unix_secs,
                 };
+                state.ip_voters.remove(&ip);
                 state.promoted_ips.insert(ip, expires_at_unix_secs);
                 state.delta_log.push(DeltaEntry::Ip(delta.clone()));
                 ip_deltas.push(delta);
@@ -258,13 +311,30 @@ impl HubEngine {
                 ack.rejected_canary += 1;
                 continue;
             }
-            ack.accepted_signatures += 1;
-            if state.promoted_sigs.contains(&key) {
+            if state.promoted_sigs.contains_key(&key) {
+                ack.accepted_signatures += 1;
                 continue;
             }
-            let voters = state.sig_voters.entry(key.clone()).or_default();
-            voters.insert(batch.node_id.clone());
-            if voters.len() >= self.quorum_min_nodes {
+            if !state.sig_voters.contains_key(&key)
+                && state.sig_voters.len() + state.promoted_sigs.len() >= self.limits.max_signatures
+            {
+                ack.rejected_capacity += 1;
+                continue;
+            }
+            let voters = state
+                .sig_voters
+                .entry(key.clone())
+                .or_insert_with(|| Votes {
+                    nodes: HashSet::new(),
+                    expires: vote_expiry,
+                });
+            if !voters.nodes.contains(&batch.node_id) && voters.nodes.len() >= MAX_HUB_VOTERS {
+                ack.rejected_capacity += 1;
+                continue;
+            }
+            voters.nodes.insert(batch.node_id.clone());
+            ack.accepted_signatures += 1;
+            if voters.nodes.len() >= self.quorum_min_nodes {
                 state.latest_seq += 1;
                 let delta = SignatureDelta {
                     seq: state.latest_seq,
@@ -272,11 +342,14 @@ impl HubEngine {
                     path_prefix: key.1.clone(),
                     threat: signal.threat,
                 };
-                state.promoted_sigs.insert(key);
+                state.sig_voters.remove(&key);
+                state.promoted_sigs.insert(key, vote_expiry);
                 state.delta_log.push(DeltaEntry::Signature(delta.clone()));
                 signature_deltas.push(delta);
             }
         }
+        self.capacity_rejected
+            .fetch_add(ack.rejected_capacity as u64, Ordering::Relaxed);
         ack.latest_seq = state.latest_seq;
         if !ip_deltas.is_empty() || !signature_deltas.is_empty() {
             // Sending while locked preserves publication order between concurrent writers.
@@ -287,6 +360,17 @@ impl HubEngine {
             });
         }
         ack
+    }
+
+    /// (IP entries, signature entries, retained deltas). Includes votes below quorum.
+    pub fn retained_counts(&self) -> (usize, usize, usize) {
+        let mut state = self.state.lock().expect("Hub state lock poisoned");
+        state.expire((self.clock)());
+        (
+            state.ip_voters.len() + state.promoted_ips.len(),
+            state.sig_voters.len() + state.promoted_sigs.len(),
+            state.delta_log.len(),
+        )
     }
 
     pub fn pull_since(&self, since_seq: u64) -> HubDeltaBatch {
@@ -318,6 +402,21 @@ impl HubEngine {
     }
 }
 
+fn validate_batch(batch: &SignalBatch) -> Result<(), &'static str> {
+    use prost::Message;
+    if batch.encoded_len() > 256 * 1024
+        || batch.node_id.len() > 128
+        || batch.ip_signals.len() + batch.signature_signals.len() > MAX_HUB_BATCH
+        || batch
+            .signature_signals
+            .iter()
+            .any(|s| s.method.len() > 32 || s.path_prefix.len() > MAX_SIGNATURE_BYTES)
+    {
+        return Err("Hub batch exceeds admission limits");
+    }
+    Ok(())
+}
+
 /// Every network RPC requires a credential. Distinct quorum voters require
 /// distinct per-node tokens; a shared token represents exactly one voter.
 #[derive(Clone)]
@@ -325,6 +424,7 @@ pub struct CustosHubGrpcService {
     pub engine: Arc<HubEngine>,
     shared_token: String,
     node_tokens: BTreeMap<String, String>,
+    streams: Arc<tokio::sync::Semaphore>,
 }
 
 pub type JevHubGrpcService = CustosHubGrpcService;
@@ -332,8 +432,10 @@ pub type JevHubGrpcService = CustosHubGrpcService;
 impl CustosHubGrpcService {
     /// Constructs a deny-all service until explicit credentials are supplied.
     pub fn new(engine: Arc<HubEngine>) -> Self {
+        let streams = Arc::new(tokio::sync::Semaphore::new(engine.limits.hub_max_streams));
         Self {
             engine,
+            streams,
             shared_token: String::new(),
             node_tokens: BTreeMap::new(),
         }
@@ -347,6 +449,14 @@ impl CustosHubGrpcService {
         anyhow::ensure!(
             !shared_token.is_empty() || !node_tokens.is_empty(),
             "Configure hub.api_token or hub.node_tokens before starting the Hub"
+        );
+        anyhow::ensure!(
+            engine.quorum_min_nodes <= MAX_HUB_VOTERS,
+            "Hub quorum exceeds the 64-voter bound"
+        );
+        anyhow::ensure!(
+            node_tokens.keys().all(|node| node.len() <= 120),
+            "Hub node identity exceeds 120 bytes"
         );
         let mut unique = HashSet::new();
         if !shared_token.is_empty() {
@@ -362,14 +472,19 @@ impl CustosHubGrpcService {
                 "Hub node credentials must be distinct"
             );
         }
+        let streams = Arc::new(tokio::sync::Semaphore::new(engine.limits.hub_max_streams));
         Ok(Self {
             engine,
+            streams,
             shared_token,
             node_tokens,
         })
     }
 
     fn authenticate(&self, node: &str, token: &str) -> Option<String> {
+        if node.len() > 120 {
+            return None;
+        }
         if !self.shared_token.is_empty() && constant_time_eq(token, &self.shared_token) {
             return Some("shared-fleet-credential".to_string());
         }
@@ -393,6 +508,8 @@ impl CustosHubGrpcService {
 
     pub fn into_server(self) -> CustosHubServiceServer<Self> {
         CustosHubServiceServer::new(self)
+            .max_decoding_message_size(256 * 1024)
+            .max_encoding_message_size(4 * 1024 * 1024)
     }
 }
 
@@ -416,6 +533,7 @@ impl CustosHubService for CustosHubGrpcService {
         batch.node_id = self
             .authenticate(&batch.node_id, &batch.api_token)
             .ok_or_else(|| Status::unauthenticated("Invalid Hub credentials"))?;
+        validate_batch(&batch).map_err(Status::resource_exhausted)?;
         Ok(Response::new(self.engine.ingest_batch(batch)))
     }
 
@@ -445,12 +563,19 @@ impl CustosHubService for CustosHubGrpcService {
         let authenticated_node = self
             .authenticate_metadata(&request, node)
             .ok_or_else(|| Status::unauthenticated("Invalid Hub credentials"))?;
+        let stream_permit = self
+            .streams
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("Hub stream capacity reached"))?;
         let mut inbound = request.into_inner();
         let engine = self.engine.clone();
         let broadcast_rx = engine.subscribe();
-        let (tx, rx) = mpsc::channel(128);
+        let (tx, rx) = mpsc::channel(1);
         tokio::spawn(async move {
-            let Some(Ok(first)) = inbound.next().await else {
+            let Ok(Some(Ok(first))) =
+                tokio::time::timeout(Duration::from_secs(5), inbound.next()).await
+            else {
                 return;
             };
             // Every new connection starts with an active-state snapshot. Absolute
@@ -467,7 +592,15 @@ impl CustosHubService for CustosHubGrpcService {
             }
             if let Some(mut signals) = first.signals {
                 signals.node_id = authenticated_node.clone();
-                engine.ingest_batch(signals);
+                let ack = engine.ingest_batch(signals);
+                if ack.rejected_capacity > 0 || ack.rejected_invalid > 0 {
+                    let _ = tx
+                        .send(Err(Status::resource_exhausted(
+                            "Hub signal capacity reached",
+                        )))
+                        .await;
+                    return;
+                }
             }
             loop {
                 tokio::select! {
@@ -475,7 +608,11 @@ impl CustosHubService for CustosHubGrpcService {
                     incoming = inbound.next() => match incoming {
                         Some(Ok(msg)) => if let Some(mut signals) = msg.signals {
                             signals.node_id = authenticated_node.clone();
-                            engine.ingest_batch(signals);
+                            let ack = engine.ingest_batch(signals);
+                            if ack.rejected_capacity > 0 || ack.rejected_invalid > 0 {
+                                let _ = tx.send(Err(Status::resource_exhausted("Hub signal capacity reached"))).await;
+                                break;
+                            }
                         },
                         _ => break,
                     },
@@ -486,7 +623,11 @@ impl CustosHubService for CustosHubGrpcService {
                 }
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let guarded = ReceiverStream::new(rx).map(move |item| {
+            let _ = &stream_permit;
+            item
+        });
+        Ok(Response::new(Box::pin(guarded)))
     }
 }
 
@@ -624,10 +765,13 @@ pub fn apply_hub_delta_to_pipeline(
         let threat_proto = ThreatClassProto::try_from(sig_delta.threat)
             .unwrap_or(ThreatClassProto::ThreatClassUnspecified);
         let threat_str = proto_to_threat_str(threat_proto);
-        pipeline.window.register_auto_signature(
-            &sig_delta.method,
-            &sig_delta.path_prefix,
-            threat_str,
+        anyhow::ensure!(
+            pipeline.window.try_register_auto_signature(
+                &sig_delta.method,
+                &sig_delta.path_prefix,
+                threat_str
+            ),
+            "Local signature capacity reached"
         );
         applied_sigs += 1;
     }
@@ -648,12 +792,29 @@ pub async fn push_verdicts_via_grpc(
     verdicts: &[ActorVerdict],
     default_ttl_secs: u64,
 ) -> Result<PushAck> {
-    let batch = build_signal_batch_from_verdicts(node_id, api_token, verdicts, default_ttl_secs);
     let mut client = CustosHubServiceClient::connect(endpoint.to_string())
         .await
         .with_context(|| format!("Failed to connect to CustosHub gRPC server at {endpoint}"))?;
-    let resp = client.push_signals(Request::new(batch)).await?;
-    Ok(resp.into_inner())
+    let mut total = PushAck::default();
+    for chunk in verdicts.chunks(MAX_HUB_BATCH) {
+        let batch = build_signal_batch_from_verdicts(node_id, api_token, chunk, default_ttl_secs);
+        validate_batch(&batch).map_err(anyhow::Error::msg)?;
+        let ack = client.push_signals(Request::new(batch)).await?.into_inner();
+        total.accepted_ips = total.accepted_ips.saturating_add(ack.accepted_ips);
+        total.accepted_signatures = total
+            .accepted_signatures
+            .saturating_add(ack.accepted_signatures);
+        total.rejected_canary = total.rejected_canary.saturating_add(ack.rejected_canary);
+        total.rejected_capacity = total
+            .rejected_capacity
+            .saturating_add(ack.rejected_capacity);
+        total.rejected_invalid = total.rejected_invalid.saturating_add(ack.rejected_invalid);
+        total.latest_seq = ack.latest_seq;
+        if ack.rejected_capacity > 0 || ack.rejected_invalid > 0 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 pub async fn pull_and_apply_via_grpc(
@@ -733,10 +894,13 @@ pub async fn run_hub_sync(
             let _handshake_tx = handshake_tx;
             loop {
                 if let Some(batch) = pending.as_ref() {
+                    validate_batch(batch).map_err(anyhow::Error::msg)?;
                     let mut batch = batch.clone();
                     batch.node_id = node_id.clone();
                     batch.api_token = api_token.clone();
-                    client.push_signals(Request::new(batch)).await?;
+                    validate_batch(&batch).map_err(anyhow::Error::msg)?;
+                    let ack = client.push_signals(Request::new(batch)).await?.into_inner();
+                    anyhow::ensure!(ack.rejected_capacity == 0 && ack.rejected_invalid == 0, "Hub admission rejected signals; retaining batch for retry");
                     pending = None;
                 }
                 tokio::select! {
@@ -747,7 +911,7 @@ pub async fn run_hub_sync(
                         retry_delay = Duration::from_millis(100);
                     },
                     batch = signals.recv() => match batch {
-                        Some(batch) => pending = Some(batch),
+                        Some(batch) => { validate_batch(&batch).map_err(anyhow::Error::msg)?; pending = Some(batch); },
                         None => return Ok::<bool, anyhow::Error>(true),
                     }
                 }

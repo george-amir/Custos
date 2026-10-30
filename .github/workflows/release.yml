@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.2.0)"
-        required: false
-        default: "v0.2.0"
+        description: "Release tag (e.g. v0.3.0)"
+        required: true
+        default: "v0.3.0"
 
 permissions:
   contents: write
@@ -68,7 +68,19 @@ jobs:
       - name: Upload release asset to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name != 'main' && github.ref_name || inputs.tag || 'v0.2.0' }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
           files: custos-${{ matrix.target }}.${{ matrix.archive }}
+          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release:
+    name: Publish complete release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish after every platform asset is uploaded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -1,5 +1,5 @@
 use crate::config::JevConfig;
-use crate::sanitizer::ActorStateSummary;
+use crate::sanitizer::{ActorStateSummary, redact_sensitive};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,7 +53,6 @@ pub enum JevAnswer {
         choice: String,
         #[serde(default)]
         probabilities: BTreeMap<String, f64>,
-        #[serde(default)]
         confidence: f64,
     },
     Score {
@@ -102,11 +101,28 @@ pub struct JevBatchAnalyzer {
     cfg: JevConfig,
     http: reqwest::Client,
     mock_mode: bool,
+    response_limit: usize,
     pub metrics: JevClientMetrics,
 }
 
 impl JevBatchAnalyzer {
     pub fn new(cfg: JevConfig, mock_mode: bool) -> Result<Self> {
+        Self::with_response_limit(
+            cfg,
+            mock_mode,
+            crate::limits::MemoryLimits::default().max_provider_response_bytes,
+        )
+    }
+
+    pub fn with_response_limit(
+        cfg: JevConfig,
+        mock_mode: bool,
+        response_limit: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            response_limit > 0,
+            "Provider response limit must be positive"
+        );
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms))
             .build()
@@ -116,12 +132,13 @@ impl JevBatchAnalyzer {
             cfg,
             http,
             mock_mode,
+            response_limit,
             metrics: JevClientMetrics::default(),
         })
     }
 
     pub fn max_actors_per_batch(&self) -> usize {
-        self.cfg.max_actors_per_batch.max(1)
+        self.cfg.max_actors_per_batch.clamp(1, 64)
     }
 
     pub fn is_mock(&self) -> bool {
@@ -138,7 +155,7 @@ impl JevBatchAnalyzer {
             return Ok(Vec::new());
         }
 
-        let chunk_size = self.cfg.max_actors_per_batch.max(1);
+        let chunk_size = self.cfg.max_actors_per_batch.clamp(1, 64);
         let mut all_verdicts = Vec::with_capacity(summaries.len());
 
         for chunk in summaries.chunks(chunk_size) {
@@ -148,6 +165,8 @@ impl JevBatchAnalyzer {
             } else {
                 self.send_live_request(&req).await?
             };
+
+            let verdicts = self.extract_verdicts(chunk, &resp)?;
 
             self.metrics
                 .batches_evaluated
@@ -162,7 +181,6 @@ impl JevBatchAnalyzer {
                 .output_tokens_total
                 .fetch_add(resp.usage.output_tokens, Ordering::Relaxed);
 
-            let verdicts = self.extract_verdicts(chunk, &resp);
             all_verdicts.extend(verdicts);
         }
 
@@ -205,7 +223,10 @@ impl JevBatchAnalyzer {
             );
         }
 
-        let compact_actors: Vec<String> = chunk.iter().map(|a| a.to_compact_line()).collect();
+        let compact_actors: Vec<String> = chunk
+            .iter()
+            .map(|a| redact_sensitive(&a.to_compact_line()))
+            .collect();
         let state = serde_json::json!({
             "rubric": "HTTP access log windows. [REDACTED_INJECTION_ATTEMPT] indicates adversarial prompt injection in headers/URI.",
             "actors": compact_actors,
@@ -247,14 +268,13 @@ impl JevBatchAnalyzer {
             match send_res {
                 Ok(response) => {
                     let status = response.status();
+                    let body = self.read_bounded_response(response).await?;
                     if status.is_success() {
-                        let parsed: JevSystemOneResponse = response
-                            .json()
-                            .await
+                        let parsed: JevSystemOneResponse = serde_json::from_slice(&body)
                             .context("Failed to deserialize JevSystemOneResponse JSON")?;
                         return Ok(parsed);
                     }
-                    let body = response.text().await.unwrap_or_default();
+                    let body = String::from_utf8_lossy(&body[..body.len().min(2048)]);
                     if (status.as_u16() == 429 || status.is_server_error())
                         && attempt < max_attempts
                     {
@@ -280,31 +300,70 @@ impl JevBatchAnalyzer {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Jev request failed after retries")))
     }
 
+    async fn read_bounded_response(&self, mut response: reqwest::Response) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|n| n <= self.response_limit as u64),
+            "Provider response exceeds byte limit"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                chunk.len() <= self.response_limit.saturating_sub(bytes.len()),
+                "Provider response exceeds byte limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     fn extract_verdicts(
         &self,
         chunk: &[ActorStateSummary],
         resp: &JevSystemOneResponse,
-    ) -> Vec<ActorVerdict> {
+    ) -> Result<Vec<ActorVerdict>> {
+        let allowed = standard_threat_criteria();
+        let probability = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
         let mut results = Vec::with_capacity(chunk.len());
 
         for actor in chunk {
-            let Ok(ip) = actor.client_ip.parse::<IpAddr>() else {
-                continue;
-            };
+            let ip = actor
+                .client_ip
+                .parse::<IpAddr>()
+                .context("Invalid actor IP in analysis batch")?;
             let ban_key = format!("{}_should_ban", actor.actor_key);
             let class_key = format!("{}_threat_class", actor.actor_key);
 
             let noul_prob = match resp.answers.get(&ban_key) {
                 Some(JevAnswer::Noul { noul }) => *noul,
-                _ => 0.0,
+                _ => bail!("Missing or invalid ban answer for {}", actor.actor_key),
             };
 
             let (threat_class, choice_confidence) = match resp.answers.get(&class_key) {
                 Some(JevAnswer::Choice {
-                    choice, confidence, ..
-                }) => (choice.clone(), *confidence),
-                _ => ("benign_traffic".to_string(), 0.0),
+                    choice,
+                    confidence,
+                    probabilities,
+                }) => {
+                    if !allowed.contains_key(choice)
+                        || !probability(*confidence)
+                        || probabilities
+                            .iter()
+                            .any(|(k, v)| !allowed.contains_key(k) || !probability(*v))
+                        || (!probabilities.is_empty() && !probabilities.contains_key(choice))
+                        || probabilities.values().sum::<f64>() > 1.001
+                    {
+                        bail!("Invalid threat answer for {}", actor.actor_key);
+                    }
+                    (choice.clone(), *confidence)
+                }
+                _ => bail!("Missing or invalid threat answer for {}", actor.actor_key),
             };
+
+            if !probability(noul_prob) {
+                bail!("Invalid ban probability for {}", actor.actor_key);
+            }
 
             // Crucial System-1 design rule:
             // An attacker combining multiple attack vectors (e.g., Path Traversal + Prompt Injection)
@@ -343,7 +402,7 @@ impl JevBatchAnalyzer {
             });
         }
 
-        results
+        Ok(results)
     }
 
     /// Deterministic local simulator of TypeSafe Jev `/v1/systemone` so users and CI tests

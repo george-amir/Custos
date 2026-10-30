@@ -115,6 +115,7 @@ pub fn build_bouncer_router(state: AppState) -> Router {
             state.clone(),
             require_admin,
         ));
+    let requests = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     Router::new()
         .route("/v1/bouncer/check", get(handle_bouncer_check))
         .route("/v1/decisions", get(handle_list_decisions))
@@ -122,6 +123,31 @@ pub fn build_bouncer_router(state: AppState) -> Router {
         .route("/v1/stats", get(handle_stats))
         .route("/metrics", get(handle_prometheus_metrics))
         .merge(mutations)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let requests = requests.clone();
+                async move {
+                    let Ok(permit) = requests.try_acquire_owned() else {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Security API capacity reached",
+                        )
+                            .into_response();
+                    };
+                    let response = next.run(request).await;
+                    let (parts, body) = response.into_parts();
+                    let guarded =
+                        tokio_stream::StreamExt::map(body.into_data_stream(), move |chunk| {
+                            let _ = &permit;
+                            chunk
+                        });
+                    axum::response::Response::from_parts(
+                        parts,
+                        axum::body::Body::from_stream(guarded),
+                    )
+                }
+            },
+        ))
         .with_state(state)
 }
 
@@ -193,6 +219,18 @@ async fn handle_bouncer_check(
                 noul_probability: Some(decision.noul_probability),
             }),
         )
+    } else if state.store.is_at_capacity() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            Json(BouncerCheckResponse {
+                ip: ip.to_string(),
+                action: "block".into(),
+                threat_class: None,
+                reason: Some("Security decision capacity reached".into()),
+                noul_probability: None,
+            }),
+        )
     } else {
         (
             StatusCode::OK,
@@ -230,7 +268,16 @@ async fn handle_create_decision(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        (
+            if state.store.is_at_capacity() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            e.to_string(),
+        )
+    })?;
     Ok((StatusCode::CREATED, Json(decision)))
 }
 
@@ -317,6 +364,19 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
         .metrics
         .events_processed
         .load(Ordering::Relaxed);
+    let queue_rejected = state.queue_rejected.load(Ordering::Relaxed);
+    let decision_rejected = state.store.capacity_rejected.load(Ordering::Relaxed);
+    let queue_available = state.available_queue_bytes();
+    let capacity_dropped = state
+        .window
+        .metrics
+        .capacity_dropped
+        .load(Ordering::Relaxed);
+    let expired_dropped = state
+        .window
+        .metrics
+        .expired_evidence_dropped
+        .load(Ordering::Relaxed);
     let static_ignored = state.window.metrics.static_ignored.load(Ordering::Relaxed);
     let l1_bans = state.window.metrics.l1_instant_bans.load(Ordering::Relaxed);
     let promoted = state
@@ -344,6 +404,21 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
          # HELP custos_static_ignored_total Total benign static asset requests ignored at L1.\n\
          # TYPE custos_static_ignored_total counter\n\
          custos_static_ignored_total {static_ignored}\n\
+         # HELP custos_queue_rejected_total Events rejected at ingestion admission.\n\
+         # TYPE custos_queue_rejected_total counter\n\
+         custos_queue_rejected_total {queue_rejected}\n\
+         # HELP custos_decision_capacity_rejected_total Bans rejected at retained decision capacity.\n\
+         # TYPE custos_decision_capacity_rejected_total counter\n\
+         custos_decision_capacity_rejected_total {decision_rejected}\n\
+         # HELP custos_queue_available_bytes Unreserved ingestion budget.\n\
+         # TYPE custos_queue_available_bytes gauge\n\
+         custos_queue_available_bytes {queue_available}\n\
+         # HELP custos_capacity_dropped_total Events rejected at active window capacity.\n\
+         # TYPE custos_capacity_dropped_total counter\n\
+         custos_capacity_dropped_total {capacity_dropped}\n\
+         # HELP custos_expired_evidence_dropped_total Oldest expired evidence dropped at backlog capacity.\n\
+         # TYPE custos_expired_evidence_dropped_total counter\n\
+         custos_expired_evidence_dropped_total {expired_dropped}\n\
          # HELP custos_l1_instant_bans_total Instant bans triggered by L1 flood or auto-signature cache.\n\
          # TYPE custos_l1_instant_bans_total counter\n\
          custos_l1_instant_bans_total {l1_bans}\n\

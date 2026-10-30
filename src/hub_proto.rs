@@ -54,6 +54,10 @@ pub struct SignalBatch {
 
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct PushAck {
+    #[prost(uint32, tag = "5")]
+    pub rejected_capacity: u32,
+    #[prost(uint32, tag = "6")]
+    pub rejected_invalid: u32,
     #[prost(uint32, tag = "1")]
     pub accepted_ips: u32,
     #[prost(uint32, tag = "2")]
@@ -300,6 +304,14 @@ pub mod custos_hub_service_server {
             Self::from_arc(Arc::new(inner))
         }
 
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
         pub fn from_arc(inner: Arc<T>) -> Self {
             Self {
                 inner,

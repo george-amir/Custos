@@ -1,4 +1,7 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::sync::LazyLock;
 
 /// Maximum length for sanitized request paths/queries sent inside Jev state.
 pub const MAX_SANITIZED_URI_LEN: usize = 120;
@@ -20,6 +23,97 @@ const INJECTION_PHRASES: &[&str] = &[
     "override rubric",
 ];
 
+/// Decode at most two URL-encoding layers, with bounded input supplied by callers.
+/// Invalid escapes are left intact. '+' is a space only in query strings.
+pub(crate) fn decode_url(raw: &str, query: bool) -> Cow<'_, str> {
+    let mut text = Cow::Borrowed(raw);
+    for _ in 0..2 {
+        if !(text.contains('%') || query && text.contains('+')) {
+            break;
+        }
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = |b: u8| (b as char).to_digit(16).map(|n| n as u8);
+                if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    out.push(a * 16 + b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(if query && bytes[i] == b'+' {
+                b' '
+            } else {
+                bytes[i]
+            });
+            i += 1;
+        }
+        let decoded = String::from_utf8_lossy(&out).into_owned();
+        if decoded == text.as_ref() {
+            break;
+        }
+        text = Cow::Owned(decoded);
+    }
+    text
+}
+
+static SECRET_PARAMS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|[?&;\s])([^?&;=\s]+)=([^&;\s]*)").unwrap());
+static AUTH_VALUE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?-u:\b)(bearer|basic)\s+[a-z0-9._~+/=-]+").unwrap());
+
+/// Remove credentials before truncation, storage in samples, or outbound serialization.
+pub fn redact_sensitive(raw: &str) -> String {
+    let params = SECRET_PARAMS.replace_all(raw, |c: &regex::Captures<'_>| {
+        let key = decode_url(&c[1], true)
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        let sensitive = matches!(
+            key.as_str(),
+            "key"
+                | "api_key"
+                | "apikey"
+                | "password"
+                | "passwd"
+                | "pwd"
+                | "auth"
+                | "auth_key"
+                | "authkey"
+                | "sig"
+                | "authorization"
+                | "cookie"
+                | "session"
+                | "sessionid"
+                | "session_id"
+                | "sid"
+                | "code"
+        ) || [
+            "token",
+            "secret",
+            "credential",
+            "password",
+            "signature",
+            "session",
+            "sessid",
+            "csrf",
+            "xsrf",
+        ]
+        .iter()
+        .any(|part| key.contains(part));
+        if sensitive {
+            let start = c.get(2).unwrap().start() - c.get(0).unwrap().start();
+            format!("{}[REDACTED]", &c[0][..start])
+        } else {
+            c[0].to_string()
+        }
+    });
+    AUTH_VALUE
+        .replace_all(&params, "$1 [REDACTED]")
+        .into_owned()
+}
+
 /// Result of sanitizing an untrusted string from an HTTP log event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedField {
@@ -28,36 +122,46 @@ pub struct SanitizedField {
     pub special_char_count: usize,
 }
 
+/// Structural signals use the full bounded input, before redaction or clipping.
+pub(crate) fn inspect_untrusted(raw: &str) -> (usize, bool) {
+    let lower = raw.to_ascii_lowercase();
+    let prompt = INJECTION_PHRASES.iter().any(|p| lower.contains(p));
+    let special = raw
+        .bytes()
+        .filter(|b| {
+            matches!(
+                b,
+                b'\''
+                    | b'"'
+                    | b';'
+                    | b'<'
+                    | b'>'
+                    | b'|'
+                    | b'`'
+                    | b'$'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'%'
+                    | b'\\'
+            )
+        })
+        .count();
+    (special, prompt)
+}
+
 /// Strips control characters, newlines, and prompt-delimiter tokens from untrusted
 /// HTTP inputs and truncates to `max_len` characters. Also detects explicit
 /// prompt-injection phrases aimed at manipulating Jev's state evaluation.
 pub fn sanitize_untrusted(raw: &str, max_len: usize) -> SanitizedField {
-    let lower = raw.to_ascii_lowercase();
-    let prompt_injection_suspected = INJECTION_PHRASES.iter().any(|p| lower.contains(p));
+    let (special_char_count, prompt_injection_suspected) = inspect_untrusted(raw);
 
+    let redacted = redact_sensitive(raw);
     let mut cleaned = String::with_capacity(raw.len().min(max_len));
-    let mut special_char_count = 0usize;
-
-    for ch in raw.chars() {
-        // Replace control chars, newlines, tabs, and null bytes with space
-        if ch.is_control() || ch == '\r' || ch == '\n' || ch == '\t' || ch == '\0' {
-            if !cleaned.ends_with(' ') {
-                cleaned.push(' ');
-            }
-            continue;
-        }
-
-        // Count characters frequently seen in SQLi, XSS, LFI, and command injection
-        if matches!(
-            ch,
-            '\'' | '"' | ';' | '<' | '>' | '|' | '`' | '$' | '(' | ')' | '{' | '}' | '%' | '\\'
-        ) {
-            special_char_count += 1;
-        }
-
-        if cleaned.chars().count() < max_len {
-            cleaned.push(ch);
-        }
+    for ch in redacted.chars().take(max_len) {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        cleaned.push(ch);
     }
 
     let text = if prompt_injection_suspected {

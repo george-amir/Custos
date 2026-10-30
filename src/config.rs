@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
+    pub memory: crate::limits::MemoryLimits,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub logs: Vec<LogSourceConfig>,
@@ -95,6 +97,10 @@ pub struct WindowConfig {
     pub max_sample_requests: usize,
     #[serde(default = "default_max_tracked_ips")]
     pub max_tracked_ips: usize,
+    /// Conservative reservation budget for active and expired window evidence.
+    /// At least one active/expired window pair is reserved.
+    #[serde(default = "default_max_state_bytes")]
+    pub max_state_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +174,9 @@ fn default_min_suspicion_score() -> u32 {
 fn default_max_sample_requests() -> usize {
     10
 }
+fn default_max_state_bytes() -> usize {
+    64 * 1024 * 1024
+}
 fn default_max_tracked_ips() -> usize {
     50_000
 }
@@ -239,6 +248,7 @@ impl Default for WindowConfig {
             min_suspicion_score: default_min_suspicion_score(),
             max_sample_requests: default_max_sample_requests(),
             max_tracked_ips: default_max_tracked_ips(),
+            max_state_bytes: default_max_state_bytes(),
         }
     }
 }
@@ -290,6 +300,7 @@ impl AppConfig {
         {
             cfg.hub.api_token = tok;
         }
+        cfg.memory.validate()?;
         Ok(cfg)
     }
 
