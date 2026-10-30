@@ -132,7 +132,28 @@ custos firewall --backend all
 
 In production, `custos` can enforce bans at **Layer 3/4 (OS Kernel Firewall)**, **Layer 7 (Reverse-Proxy HTTP Bouncer)**, or **both simultaneously**.
 
-### 1. Linux Production Setup (`systemd` + `nftables` or `ipset`)
+### ⚡ One-Command Background Service Setup (Linux, macOS & Windows)
+
+`custos` includes a built-in cross-platform service manager (`custos service`) that automatically configures `/etc/custos/config.toml`, discovers your web server logs, sets up your native OS service (`systemd` on Linux, `launchd` on macOS, or Windows Service Control Manager on Windows), and starts the daemon in the background:
+
+```bash
+# Preview the generated systemd unit / macOS launchd plist / Windows service command
+custos service install --dry-run
+
+# Install & start Custos as a persistent background OS service with live kernel firewall enforcement
+export TYPESAFE_API_KEY="ts_live_..."
+sudo -E custos service install --firewall-live
+
+# Manage the running service at any time
+sudo custos service status
+sudo custos service stop
+sudo custos service start
+sudo custos service uninstall
+```
+
+---
+
+### 1. Manual Linux Production Setup (`systemd` + `nftables` or `ipset`)
 
 #### Step 1: Install Binary & Configuration
 ```bash

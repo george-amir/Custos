@@ -195,6 +195,34 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
+
+    /// Manage Custos as a persistent background OS service (Linux systemd, macOS launchd, Windows SCM)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// Install and start Custos as an auto-starting background OS service
+    Install {
+        /// Configure live OS kernel firewall enforcement in the installed service
+        #[arg(long, default_value_t = false)]
+        firewall_live: bool,
+
+        /// Preview the generated OS service manifest without writing system files
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Start the installed Custos background service
+    Start,
+    /// Stop the running Custos background service
+    Stop,
+    /// Show OS service status
+    Status,
+    /// Stop and remove the Custos background service
+    Uninstall,
 }
 
 #[tokio::main]
@@ -321,6 +349,16 @@ async fn main() -> Result<()> {
         Commands::Unban { ip, api_url } => cmd_unban(ip, &api_url).await,
         Commands::Check { ip, api_url } => cmd_check(ip, &api_url).await,
         Commands::Stats { api_url } => cmd_stats(&api_url).await,
+        Commands::Service { action } => match action {
+            ServiceAction::Install {
+                firewall_live,
+                dry_run,
+            } => custos::service::install_service(firewall_live, dry_run),
+            ServiceAction::Start => custos::service::start_service(),
+            ServiceAction::Stop => custos::service::stop_service(),
+            ServiceAction::Status => custos::service::status_service(),
+            ServiceAction::Uninstall => custos::service::uninstall_service(),
+        },
     }
 }
 

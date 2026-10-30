@@ -6,6 +6,7 @@ pub mod hub_proto;
 pub mod jev;
 pub mod middleware;
 pub mod sanitizer;
+pub mod service;
 pub mod store;
 pub mod tailer;
 pub mod window;
