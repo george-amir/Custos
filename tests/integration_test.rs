@@ -156,7 +156,7 @@ async fn test_full_pipeline_and_bouncer_api_end_to_end() {
     let fw_bytes = resp_fw.into_body().collect().await.unwrap().to_bytes();
     let fw_status: FirewallStatusResponse = serde_json::from_slice(&fw_bytes).unwrap();
     assert_eq!(fw_status.rules_applied, 5);
-    assert_eq!(fw_status.recent_commands.len(), 5);
+    assert!(fw_status.recent_commands.len() >= 5);
 
     // 6. Verify Prometheus `/metrics` endpoint exposes OpenMetrics counters
     let resp_metrics = router

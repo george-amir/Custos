@@ -188,10 +188,10 @@ pub fn spawn_log_tailer(
                                 break;
                             }
                             offset += bytes_read as u64;
-                            if let Some(ev) = parse_log_line(&line, source.format) {
-                                if tx.send(ev).await.is_err() {
-                                    return;
-                                }
+                            if let Some(ev) = parse_log_line(&line, source.format)
+                                && tx.send(ev).await.is_err()
+                            {
+                                return;
                             }
                             line.clear();
                         }

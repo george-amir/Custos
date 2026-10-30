@@ -188,18 +188,17 @@ impl SecurityPipeline {
                     .max(1) as u64;
                 let _ = self.firewall.ban_ip(v.client_ip, ttl);
 
-                if v.recommend_auto_signature {
-                    if let Some((method, path)) = extract_first_method_and_path(&v.sample_requests)
-                    {
-                        self.window
-                            .register_auto_signature(&method, &path, &v.threat_class);
-                        info!(
-                            method = %method,
-                            path = %path,
-                            threat_class = %v.threat_class,
-                            "Cached high-confidence Jev attack signature for L1 zero-token blocking"
-                        );
-                    }
+                if v.recommend_auto_signature
+                    && let Some((method, path)) = extract_first_method_and_path(&v.sample_requests)
+                {
+                    self.window
+                        .register_auto_signature(&method, &path, &v.threat_class);
+                    info!(
+                        method = %method,
+                        path = %path,
+                        threat_class = %v.threat_class,
+                        "Cached high-confidence Jev attack signature for L1 zero-token blocking"
+                    );
                 }
             }
         }

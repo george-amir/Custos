@@ -391,16 +391,16 @@ impl CustosHubService for CustosHubGrpcService {
                                 if !initialized_catchup {
                                     initialized_catchup = true;
                                     let catchup = engine.pull_since(msg.since_seq);
-                                    if !catchup.ip_deltas.is_empty() || !catchup.signature_deltas.is_empty() {
-                                        if tx.send(Ok(catchup)).await.is_err() {
-                                            break;
-                                        }
+                                    if (!catchup.ip_deltas.is_empty() || !catchup.signature_deltas.is_empty())
+                                        && tx.send(Ok(catchup)).await.is_err()
+                                    {
+                                        break;
                                     }
                                 }
-                                if let Some(signals) = msg.signals {
-                                    if !signals.ip_signals.is_empty() || !signals.signature_signals.is_empty() {
-                                        engine.ingest_batch(signals);
-                                    }
+                                if let Some(signals) = msg.signals
+                                    && (!signals.ip_signals.is_empty() || !signals.signature_signals.is_empty())
+                                {
+                                    engine.ingest_batch(signals);
                                 }
                             }
                             Some(Err(err)) => {
@@ -411,10 +411,10 @@ impl CustosHubService for CustosHubGrpcService {
                         }
                     }
                     bcast = broadcast_rx.recv() => {
-                        if let Ok(delta_batch) = bcast {
-                            if tx.send(Ok(delta_batch)).await.is_err() {
-                                break;
-                            }
+                        if let Ok(delta_batch) = bcast
+                            && tx.send(Ok(delta_batch)).await.is_err()
+                        {
+                            break;
                         }
                     }
                 }
@@ -449,19 +449,19 @@ pub fn build_signal_batch_from_verdicts(
             suggested_ttl_secs: default_ttl_secs as u32,
         });
 
-        if v.recommend_auto_signature {
-            if let Some(first) = v.sample_requests.first() {
-                let mut parts = first.split_whitespace();
-                if let (Some(method), Some(uri)) = (parts.next(), parts.next()) {
-                    let path = uri.split('?').next().unwrap_or(uri);
-                    let prefix = normalize_path_prefix(path);
-                    signature_signals.push(SignatureSignal {
-                        method: method.to_uppercase(),
-                        path_prefix: prefix,
-                        threat: threat_proto as i32,
-                        confidence: v.choice_confidence as f32,
-                    });
-                }
+        if v.recommend_auto_signature
+            && let Some(first) = v.sample_requests.first()
+        {
+            let mut parts = first.split_whitespace();
+            if let (Some(method), Some(uri)) = (parts.next(), parts.next()) {
+                let path = uri.split('?').next().unwrap_or(uri);
+                let prefix = normalize_path_prefix(path);
+                signature_signals.push(SignatureSignal {
+                    method: method.to_uppercase(),
+                    path_prefix: prefix,
+                    threat: threat_proto as i32,
+                    confidence: v.choice_confidence as f32,
+                });
             }
         }
     }

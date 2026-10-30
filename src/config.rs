@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -248,19 +248,6 @@ impl Default for JevConfig {
     }
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            logs: Vec::new(),
-            window: WindowConfig::default(),
-            jev: JevConfig::default(),
-            firewall: FirewallConfig::default(),
-            hub: HubConfig::default(),
-        }
-    }
-}
-
 impl AppConfig {
     pub fn load_or_default(path: Option<&Path>) -> Result<Self> {
         let mut cfg = if let Some(p) = path {
@@ -278,20 +265,20 @@ impl AppConfig {
             AppConfig::default()
         };
 
-        if cfg.jev.api_key.trim().is_empty() {
-            if let Ok(env_key) = std::env::var("TYPESAFE_API_KEY") {
-                cfg.jev.api_key = env_key;
-            }
+        if cfg.jev.api_key.trim().is_empty()
+            && let Ok(env_key) = std::env::var("TYPESAFE_API_KEY")
+        {
+            cfg.jev.api_key = env_key;
         }
-        if cfg.daemon.api_token.trim().is_empty() {
-            if let Ok(tok) = std::env::var("CUSTOS_API_TOKEN") {
-                cfg.daemon.api_token = tok;
-            }
+        if cfg.daemon.api_token.trim().is_empty()
+            && let Ok(tok) = std::env::var("CUSTOS_API_TOKEN")
+        {
+            cfg.daemon.api_token = tok;
         }
-        if cfg.hub.api_token.trim().is_empty() {
-            if let Ok(tok) = std::env::var("CUSTOS_HUB_TOKEN") {
-                cfg.hub.api_token = tok;
-            }
+        if cfg.hub.api_token.trim().is_empty()
+            && let Ok(tok) = std::env::var("CUSTOS_HUB_TOKEN")
+        {
+            cfg.hub.api_token = tok;
         }
         Ok(cfg)
     }

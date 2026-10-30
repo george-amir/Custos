@@ -378,10 +378,10 @@ fn cmd_init(output: &std::path::Path, firewall_live: bool) -> Result<()> {
         cfg.logs = discovered_logs.clone();
     }
 
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let serialized = toml::to_string_pretty(&cfg)?;
     std::fs::write(output, serialized)
@@ -564,15 +564,14 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
                             while let Some(Ok(delta)) = inbound.next().await {
                                 if let Ok((ips, sigs)) =
                                     apply_hub_delta_to_pipeline(&stream_pipeline, &delta)
+                                    && (ips > 0 || sigs > 0)
                                 {
-                                    if ips > 0 || sigs > 0 {
-                                        info!(
-                                            latest_seq = delta.latest_seq,
-                                            ips_applied = ips,
-                                            sigs_applied = sigs,
-                                            "Applied real-time gRPC HubDeltaBatch from CustosHub"
-                                        );
-                                    }
+                                    info!(
+                                        latest_seq = delta.latest_seq,
+                                        ips_applied = ips,
+                                        sigs_applied = sigs,
+                                        "Applied real-time gRPC HubDeltaBatch from CustosHub"
+                                    );
                                 }
                             }
                         }
@@ -847,11 +846,11 @@ fn cmd_firewall(mut cfg: AppConfig, backend_arg: &str, live: bool) -> Result<()>
 
 async fn cmd_decisions(api_url: &str, cfg: &AppConfig) -> Result<()> {
     let url = format!("{}/v1/decisions", api_url.trim_end_matches('/'));
-    if let Ok(resp) = reqwest::get(&url).await {
-        if let Ok(decisions) = resp.json::<Vec<BanDecision>>().await {
-            print_decisions(&decisions);
-            return Ok(());
-        }
+    if let Ok(resp) = reqwest::get(&url).await
+        && let Ok(decisions) = resp.json::<Vec<BanDecision>>().await
+    {
+        print_decisions(&decisions);
+        return Ok(());
     }
     let store = DecisionStore::open(
         cfg.daemon.decisions_file.clone(),
@@ -867,8 +866,8 @@ fn print_decisions(decisions: &[BanDecision]) {
         return;
     }
     println!(
-        "{:<18} {:<24} {:<18} {:<8} {}",
-        "IP", "THREAT CLASS", "SOURCE", "NOUL", "EXPIRES AT"
+        "{:<18} {:<24} {:<18} {:<8} EXPIRES AT",
+        "IP", "THREAT CLASS", "SOURCE", "NOUL"
     );
     println!("{}", "-".repeat(92));
     for d in decisions {
@@ -940,11 +939,11 @@ async fn cmd_stats(api_url: &str) -> Result<()> {
         .await?;
     println!("{}", serde_json::to_string_pretty(&stats)?);
 
-    if let Ok(fw_resp) = reqwest::get(&format!("{base}/v1/firewall")).await {
-        if let Ok(fw) = fw_resp.json::<FirewallStatusResponse>().await {
-            println!("\n--- Firewall Status ---");
-            println!("{}", serde_json::to_string_pretty(&fw)?);
-        }
+    if let Ok(fw_resp) = reqwest::get(&format!("{base}/v1/firewall")).await
+        && let Ok(fw) = fw_resp.json::<FirewallStatusResponse>().await
+    {
+        println!("\n--- Firewall Status ---");
+        println!("{}", serde_json::to_string_pretty(&fw)?);
     }
     Ok(())
 }

@@ -75,11 +75,11 @@ impl DecisionStore {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(decision) = serde_json::from_str::<BanDecision>(&line) {
-                if !decision.is_expired(now) {
-                    self.active_bans.insert(decision.ip, decision);
-                    loaded += 1;
-                }
+            if let Ok(decision) = serde_json::from_str::<BanDecision>(&line)
+                && !decision.is_expired(now)
+            {
+                self.active_bans.insert(decision.ip, decision);
+                loaded += 1;
             }
         }
         if loaded > 0 {
@@ -109,6 +109,7 @@ impl DecisionStore {
     }
 
     /// Records a new `BanDecision` with the configured or custom TTL and appends it to disk.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_ban(
         &self,
         ip: IpAddr,
@@ -176,10 +177,10 @@ impl DecisionStore {
     /// Compacts `decisions.jsonl` on disk so it only contains currently active, non-expired decisions.
     pub fn compact_persistence_file(&self) -> Result<()> {
         let active = self.list_active();
-        if let Some(parent) = self.persistence_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = self.persistence_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new()
             .create(true)
@@ -200,10 +201,10 @@ impl DecisionStore {
     }
 
     fn append_to_disk(&self, decision: &BanDecision) -> Result<()> {
-        if let Some(parent) = self.persistence_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = self.persistence_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new()
             .create(true)

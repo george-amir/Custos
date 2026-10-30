@@ -79,17 +79,16 @@ pub async fn custos_bouncer_middleware(
 
 fn extract_client_ip(req: &Request<Body>) -> IpAddr {
     let headers = req.headers();
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = real_ip.trim().parse::<IpAddr>() {
-            return ip;
-        }
+    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+        && let Ok(ip) = real_ip.trim().parse::<IpAddr>()
+    {
+        return ip;
     }
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(first) = xff.split(',').next()
+        && let Ok(ip) = first.trim().parse::<IpAddr>()
+    {
+        return ip;
     }
     IpAddr::from([127, 0, 0, 1])
 }
