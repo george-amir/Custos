@@ -86,6 +86,8 @@ pub struct IpBanDelta {
     pub confidence: f32,
     #[prost(uint32, tag = "6")]
     pub ttl_secs: u32,
+    #[prost(int64, tag = "7")]
+    pub expires_at_unix_secs: i64,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

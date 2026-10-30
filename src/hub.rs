@@ -1,27 +1,26 @@
 pub use crate::hub_proto as proto;
 
-use crate::SecurityPipeline;
 use crate::jev::ActorVerdict;
 use crate::store::DecisionSource;
-use crate::window::normalize_path_prefix;
+use crate::{SecurityPipeline, proven_signature_for_verdict};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
+
 use proto::custos_hub_service_client::CustosHubServiceClient;
 use proto::custos_hub_service_server::{CustosHubService, CustosHubServiceServer};
 use proto::{
     HubDeltaBatch, IpBanDelta, IpSignal, NodeStreamMessage, PullRequest, PushAck, SignalBatch,
     SignatureDelta, SignatureSignal, ThreatClassProto,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 /// Encodes an `IpAddr` into compact binary form (4 bytes for IPv4, 16 bytes for IPv6).
 pub fn ip_to_bytes(ip: IpAddr) -> Vec<u8> {
@@ -143,210 +142,268 @@ impl DeltaEntry {
     }
 }
 
-/// Core consensus and monotonic delta engine for `jevsec hub`.
+/// State and its cursor are committed under one lock. A published cursor never
+/// refers to an entry that a reader could not have observed.
+#[derive(Default)]
+struct HubState {
+    latest_seq: u64,
+    ip_voters: HashMap<IpAddr, HashSet<String>>,
+    promoted_ips: HashMap<IpAddr, i64>,
+    sig_voters: HashMap<(String, String), HashSet<String>>,
+    promoted_sigs: HashSet<(String, String)>,
+    delta_log: Vec<DeltaEntry>,
+}
+
+impl HubState {
+    fn expire(&mut self, now: i64) {
+        self.promoted_ips.retain(|ip, expiry| {
+            if *expiry <= now {
+                self.ip_voters.remove(ip);
+                false
+            } else {
+                true
+            }
+        });
+        self.delta_log.retain(|entry| match entry {
+            DeltaEntry::Ip(delta) => delta.expires_at_unix_secs > now,
+            DeltaEntry::Signature(_) => true,
+        });
+    }
+}
+
+/// Core consensus engine. Callers of ingest_batch must provide an authenticated
+/// node identity; network callers are authenticated by CustosHubGrpcService.
 pub struct HubEngine {
     quorum_min_nodes: usize,
-    next_seq: AtomicU64,
-    ip_voters: DashMap<IpAddr, HashSet<String>>,
-    promoted_ips: DashMap<IpAddr, u64>,
-    sig_voters: DashMap<(String, String), HashSet<String>>,
-    promoted_sigs: DashMap<(String, String), u64>,
-    delta_log: RwLock<Vec<DeltaEntry>>,
+    state: Mutex<HubState>,
     broadcaster: broadcast::Sender<HubDeltaBatch>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl HubEngine {
     pub fn new(quorum_min_nodes: usize) -> Self {
+        Self::with_clock(
+            quorum_min_nodes,
+            Arc::new(|| chrono::Utc::now().timestamp()),
+        )
+    }
+
+    /// Clock injection permits deterministic expiry checks by embedders and tests.
+    pub fn with_clock(quorum_min_nodes: usize, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
         let (broadcaster, _) = broadcast::channel(1024);
         Self {
             quorum_min_nodes: quorum_min_nodes.max(1),
-            next_seq: AtomicU64::new(1),
-            ip_voters: DashMap::new(),
-            promoted_ips: DashMap::new(),
-            sig_voters: DashMap::new(),
-            promoted_sigs: DashMap::new(),
-            delta_log: RwLock::new(Vec::new()),
+            state: Mutex::new(HubState::default()),
             broadcaster,
+            clock,
         }
     }
 
     pub fn latest_seq(&self) -> u64 {
-        self.next_seq.load(Ordering::Relaxed).saturating_sub(1)
+        self.state
+            .lock()
+            .expect("Hub state lock poisoned")
+            .latest_seq
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<HubDeltaBatch> {
         self.broadcaster.subscribe()
     }
 
-    /// Ingests a `SignalBatch` from an edge node, applies canary anti-poisoning checks,
-    /// updates multi-node quorum sets, appends newly promoted items to the monotonic delta log,
-    /// and broadcasts real-time updates to all active gRPC stream subscribers.
     pub fn ingest_batch(&self, batch: SignalBatch) -> PushAck {
-        let node_id = if batch.node_id.trim().is_empty() {
-            "anonymous-node".to_string()
-        } else {
-            batch.node_id.trim().to_string()
-        };
-
-        let mut accepted_ips = 0u32;
-        let mut accepted_signatures = 0u32;
-        let mut rejected_canary = 0u32;
-        let mut new_ip_deltas = Vec::new();
-        let mut new_sig_deltas = Vec::new();
-
-        for sig in batch.ip_signals {
-            let Some(ip) = bytes_to_ip(&sig.ip) else {
+        let now = (self.clock)();
+        let mut state = self.state.lock().expect("Hub state lock poisoned");
+        state.expire(now);
+        let mut ack = PushAck::default();
+        let mut ip_deltas = Vec::new();
+        let mut signature_deltas = Vec::new();
+        for signal in batch.ip_signals {
+            let Some(ip) = bytes_to_ip(&signal.ip) else {
                 continue;
             };
             if is_protected_canary_ip(&ip) {
-                rejected_canary += 1;
-                warn!(node_id = %node_id, ip = %ip, "Rejected canary/protected IP signal from node");
+                ack.rejected_canary += 1;
                 continue;
             }
-            accepted_ips += 1;
-
-            if self.promoted_ips.contains_key(&ip) {
+            ack.accepted_ips += 1;
+            if state.promoted_ips.contains_key(&ip) {
                 continue;
             }
-
-            let mut voters = self.ip_voters.entry(ip).or_default();
-            voters.insert(node_id.clone());
-            let vote_count = voters.len();
-            drop(voters);
-
-            if vote_count >= self.quorum_min_nodes {
-                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-                self.promoted_ips.insert(ip, seq);
+            let voters = state.ip_voters.entry(ip).or_default();
+            voters.insert(batch.node_id.clone());
+            if voters.len() >= self.quorum_min_nodes {
+                state.latest_seq += 1;
+                let ttl_secs = signal.suggested_ttl_secs.clamp(1, 86400);
+                let expires_at_unix_secs = now.saturating_add(i64::from(ttl_secs));
                 let delta = IpBanDelta {
-                    seq,
+                    seq: state.latest_seq,
                     ip: ip_to_bytes(ip),
-                    threat: sig.threat,
-                    noul: sig.noul,
-                    confidence: sig.confidence,
-                    ttl_secs: sig.suggested_ttl_secs.max(300),
+                    threat: signal.threat,
+                    noul: signal.noul,
+                    confidence: signal.confidence,
+                    ttl_secs,
+                    expires_at_unix_secs,
                 };
-                new_ip_deltas.push(delta);
-                info!(
-                    seq,
-                    ip = %ip,
-                    voters = vote_count,
-                    "Promoted IP ban to global JevHub delta feed"
-                );
+                state.promoted_ips.insert(ip, expires_at_unix_secs);
+                state.delta_log.push(DeltaEntry::Ip(delta.clone()));
+                ip_deltas.push(delta);
             }
         }
-
-        for sig in batch.signature_signals {
-            let method = sig.method.trim().to_uppercase();
-            let prefix = normalize_path_prefix(&sig.path_prefix);
-            if is_protected_route_prefix(&prefix) {
-                rejected_canary += 1;
-                warn!(
-                    node_id = %node_id,
-                    path = %prefix,
-                    "Rejected protected route prefix from global L1 signature feed"
-                );
+        for signal in batch.signature_signals {
+            let key = (
+                signal.method.trim().to_uppercase(),
+                signal.path_prefix.trim().to_string(),
+            );
+            if is_protected_route_prefix(&key.1) {
+                ack.rejected_canary += 1;
                 continue;
             }
-            accepted_signatures += 1;
-
-            let key = (method.clone(), prefix.clone());
-            if self.promoted_sigs.contains_key(&key) {
+            ack.accepted_signatures += 1;
+            if state.promoted_sigs.contains(&key) {
                 continue;
             }
-
-            let mut voters = self.sig_voters.entry(key.clone()).or_default();
-            voters.insert(node_id.clone());
-            let vote_count = voters.len();
-            drop(voters);
-
-            if vote_count >= self.quorum_min_nodes {
-                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-                self.promoted_sigs.insert(key, seq);
+            let voters = state.sig_voters.entry(key.clone()).or_default();
+            voters.insert(batch.node_id.clone());
+            if voters.len() >= self.quorum_min_nodes {
+                state.latest_seq += 1;
                 let delta = SignatureDelta {
-                    seq,
-                    method: method.clone(),
-                    path_prefix: prefix.clone(),
-                    threat: sig.threat,
+                    seq: state.latest_seq,
+                    method: key.0.clone(),
+                    path_prefix: key.1.clone(),
+                    threat: signal.threat,
                 };
-                new_sig_deltas.push(delta);
-                info!(
-                    seq,
-                    method = %method,
-                    path_prefix = %prefix,
-                    voters = vote_count,
-                    "Promoted zero-day L1 signature to global JevHub delta feed"
-                );
+                state.promoted_sigs.insert(key);
+                state.delta_log.push(DeltaEntry::Signature(delta.clone()));
+                signature_deltas.push(delta);
             }
         }
-
-        if !new_ip_deltas.is_empty() || !new_sig_deltas.is_empty() {
-            if let Ok(mut guard) = self.delta_log.write() {
-                for d in &new_ip_deltas {
-                    guard.push(DeltaEntry::Ip(d.clone()));
-                }
-                for s in &new_sig_deltas {
-                    guard.push(DeltaEntry::Signature(s.clone()));
-                }
-            }
-
-            let latest_seq = self.latest_seq();
-            let push_batch = HubDeltaBatch {
-                latest_seq,
-                ip_deltas: new_ip_deltas,
-                signature_deltas: new_sig_deltas,
-            };
-            let _ = self.broadcaster.send(push_batch);
+        ack.latest_seq = state.latest_seq;
+        if !ip_deltas.is_empty() || !signature_deltas.is_empty() {
+            // Sending while locked preserves publication order between concurrent writers.
+            let _ = self.broadcaster.send(HubDeltaBatch {
+                latest_seq: state.latest_seq,
+                ip_deltas,
+                signature_deltas,
+            });
         }
-
-        PushAck {
-            accepted_ips,
-            accepted_signatures,
-            rejected_canary,
-            latest_seq: self.latest_seq(),
-        }
+        ack
     }
 
-    /// Returns all delta items with `seq > since_seq`.
     pub fn pull_since(&self, since_seq: u64) -> HubDeltaBatch {
-        let mut ip_deltas = Vec::new();
-        let mut signature_deltas = Vec::new();
-
-        if let Ok(guard) = self.delta_log.read() {
-            for entry in guard.iter() {
-                if entry.seq() > since_seq {
-                    match entry {
-                        DeltaEntry::Ip(d) => ip_deltas.push(d.clone()),
-                        DeltaEntry::Signature(s) => signature_deltas.push(s.clone()),
+        let now = (self.clock)();
+        let mut state = self.state.lock().expect("Hub state lock poisoned");
+        state.expire(now);
+        let since_seq = if since_seq > state.latest_seq {
+            0
+        } else {
+            since_seq
+        };
+        let mut result = HubDeltaBatch {
+            latest_seq: state.latest_seq,
+            ..HubDeltaBatch::default()
+        };
+        for entry in &state.delta_log {
+            if entry.seq() > since_seq {
+                match entry {
+                    DeltaEntry::Ip(delta) => {
+                        let mut delta = delta.clone();
+                        delta.ttl_secs = (delta.expires_at_unix_secs - now) as u32;
+                        result.ip_deltas.push(delta);
                     }
+                    DeltaEntry::Signature(delta) => result.signature_deltas.push(delta.clone()),
                 }
             }
         }
-
-        HubDeltaBatch {
-            latest_seq: self.latest_seq(),
-            ip_deltas,
-            signature_deltas,
-        }
+        result
     }
 }
 
-/// gRPC server implementation of `CustosHubService`.
+/// Every network RPC requires a credential. Distinct quorum voters require
+/// distinct per-node tokens; a shared token represents exactly one voter.
 #[derive(Clone)]
 pub struct CustosHubGrpcService {
     pub engine: Arc<HubEngine>,
+    shared_token: String,
+    node_tokens: BTreeMap<String, String>,
 }
 
-/// Backwards-compatible alias for `CustosHubGrpcService`.
 pub type JevHubGrpcService = CustosHubGrpcService;
 
 impl CustosHubGrpcService {
+    /// Constructs a deny-all service until explicit credentials are supplied.
     pub fn new(engine: Arc<HubEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            shared_token: String::new(),
+            node_tokens: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_auth(
+        engine: Arc<HubEngine>,
+        shared_token: String,
+        node_tokens: BTreeMap<String, String>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !shared_token.is_empty() || !node_tokens.is_empty(),
+            "Configure hub.api_token or hub.node_tokens before starting the Hub"
+        );
+        let mut unique = HashSet::new();
+        if !shared_token.is_empty() {
+            unique.insert(shared_token.clone());
+        }
+        for (node, token) in &node_tokens {
+            anyhow::ensure!(
+                !node.trim().is_empty() && !token.is_empty(),
+                "Hub node identities and credentials must be nonempty"
+            );
+            anyhow::ensure!(
+                unique.insert(token.clone()),
+                "Hub node credentials must be distinct"
+            );
+        }
+        Ok(Self {
+            engine,
+            shared_token,
+            node_tokens,
+        })
+    }
+
+    fn authenticate(&self, node: &str, token: &str) -> Option<String> {
+        if !self.shared_token.is_empty() && constant_time_eq(token, &self.shared_token) {
+            return Some("shared-fleet-credential".to_string());
+        }
+        if let Some(expected) = self.node_tokens.get(node)
+            && constant_time_eq(token, expected)
+        {
+            return Some(format!("node:{node}"));
+        }
+        None
+    }
+
+    fn authenticate_metadata<T>(&self, request: &Request<T>, node: &str) -> Option<String> {
+        let token = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        self.authenticate(node, token)
     }
 
     pub fn into_server(self) -> CustosHubServiceServer<Self> {
         CustosHubServiceServer::new(self)
     }
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }
 
 #[tonic::async_trait]
@@ -355,17 +412,22 @@ impl CustosHubService for CustosHubGrpcService {
         &self,
         request: Request<SignalBatch>,
     ) -> Result<Response<PushAck>, Status> {
-        let ack = self.engine.ingest_batch(request.into_inner());
-        Ok(Response::new(ack))
+        let mut batch = request.into_inner();
+        batch.node_id = self
+            .authenticate(&batch.node_id, &batch.api_token)
+            .ok_or_else(|| Status::unauthenticated("Invalid Hub credentials"))?;
+        Ok(Response::new(self.engine.ingest_batch(batch)))
     }
 
     async fn pull_deltas(
         &self,
         request: Request<PullRequest>,
     ) -> Result<Response<HubDeltaBatch>, Status> {
-        let req = request.into_inner();
-        let deltas = self.engine.pull_since(req.since_seq);
-        Ok(Response::new(deltas))
+        self.authenticate_metadata(&request, &request.get_ref().node_id)
+            .ok_or_else(|| Status::unauthenticated("Invalid Hub credentials"))?;
+        Ok(Response::new(
+            self.engine.pull_since(request.into_inner().since_seq),
+        ))
     }
 
     type StreamIntelStream =
@@ -375,54 +437,94 @@ impl CustosHubService for CustosHubGrpcService {
         &self,
         request: Request<Streaming<NodeStreamMessage>>,
     ) -> Result<Response<Self::StreamIntelStream>, Status> {
+        let node = request
+            .metadata()
+            .get("x-custos-node")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let authenticated_node = self
+            .authenticate_metadata(&request, node)
+            .ok_or_else(|| Status::unauthenticated("Invalid Hub credentials"))?;
         let mut inbound = request.into_inner();
         let engine = self.engine.clone();
-        let mut broadcast_rx = engine.subscribe();
+        let broadcast_rx = engine.subscribe();
         let (tx, rx) = mpsc::channel(128);
-
         tokio::spawn(async move {
-            let mut initialized_catchup = false;
-
+            let Some(Ok(first)) = inbound.next().await else {
+                return;
+            };
+            // Every new connection starts with an active-state snapshot. Absolute
+            // expiration makes this safe even after the Hub itself has restarted.
+            let mut subscription = HubSubscription {
+                engine: engine.clone(),
+                receiver: broadcast_rx,
+                cursor: 0,
+            };
+            let snapshot = engine.pull_since(0);
+            subscription.cursor = snapshot.latest_seq;
+            if tx.send(Ok(snapshot)).await.is_err() {
+                return;
+            }
+            if let Some(mut signals) = first.signals {
+                signals.node_id = authenticated_node.clone();
+                engine.ingest_batch(signals);
+            }
             loop {
                 tokio::select! {
-                    msg_opt = inbound.next() => {
-                        match msg_opt {
-                            Some(Ok(msg)) => {
-                                if !initialized_catchup {
-                                    initialized_catchup = true;
-                                    let catchup = engine.pull_since(msg.since_seq);
-                                    if (!catchup.ip_deltas.is_empty() || !catchup.signature_deltas.is_empty())
-                                        && tx.send(Ok(catchup)).await.is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                if let Some(signals) = msg.signals
-                                    && (!signals.ip_signals.is_empty() || !signals.signature_signals.is_empty())
-                                {
-                                    engine.ingest_batch(signals);
-                                }
-                            }
-                            Some(Err(err)) => {
-                                debug!(error = %err, "Node gRPC stream closed with error");
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-                    bcast = broadcast_rx.recv() => {
-                        if let Ok(delta_batch) = bcast
-                            && tx.send(Ok(delta_batch)).await.is_err()
-                        {
-                            break;
-                        }
+                    _ = tx.closed() => break,
+                    incoming = inbound.next() => match incoming {
+                        Some(Ok(msg)) => if let Some(mut signals) = msg.signals {
+                            signals.node_id = authenticated_node.clone();
+                            engine.ingest_batch(signals);
+                        },
+                        _ => break,
+                    },
+                    delta = subscription.next() => match delta {
+                        Some(delta) => if tx.send(Ok(delta)).await.is_err() { break; },
+                        None => break,
                     }
                 }
             }
         });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
 
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(output_stream)))
+/// Cursor-based delivery uses notifications only as a wakeup. The committed log
+/// is authoritative, so lagging or coalesced notifications cannot lose deltas.
+pub struct HubSubscription {
+    engine: Arc<HubEngine>,
+    receiver: broadcast::Receiver<HubDeltaBatch>,
+    cursor: u64,
+}
+
+impl HubSubscription {
+    pub fn new(engine: Arc<HubEngine>, since_seq: u64) -> Self {
+        let receiver = engine.subscribe();
+        Self {
+            engine,
+            receiver,
+            cursor: since_seq,
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<HubDeltaBatch> {
+        loop {
+            let snapshot = self.engine.pull_since(self.cursor);
+            if snapshot.latest_seq != self.cursor {
+                self.cursor = snapshot.latest_seq;
+                return Some(snapshot);
+            }
+            match self.receiver.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Coalesce old notifications before reading the log again.
+                    while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) =
+                        self.receiver.try_recv()
+                    {}
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 }
 
@@ -449,20 +551,13 @@ pub fn build_signal_batch_from_verdicts(
             suggested_ttl_secs: default_ttl_secs as u32,
         });
 
-        if v.recommend_auto_signature
-            && let Some(first) = v.sample_requests.first()
-        {
-            let mut parts = first.split_whitespace();
-            if let (Some(method), Some(uri)) = (parts.next(), parts.next()) {
-                let path = uri.split('?').next().unwrap_or(uri);
-                let prefix = normalize_path_prefix(path);
-                signature_signals.push(SignatureSignal {
-                    method: method.to_uppercase(),
-                    path_prefix: prefix,
-                    threat: threat_proto as i32,
-                    confidence: v.choice_confidence as f32,
-                });
-            }
+        if let Some((method, path_prefix)) = proven_signature_for_verdict(v) {
+            signature_signals.push(SignatureSignal {
+                method,
+                path_prefix,
+                threat: threat_proto as i32,
+                confidence: v.choice_confidence as f32,
+            });
         }
     }
 
@@ -482,6 +577,7 @@ pub fn apply_hub_delta_to_pipeline(
     pipeline: &SecurityPipeline,
     delta: &HubDeltaBatch,
 ) -> Result<(usize, usize)> {
+    let _enforcement = pipeline.enforcement_guard()?;
     let mut new_fw_entries: Vec<(IpAddr, u64)> = Vec::new();
     let mut applied_ips = 0usize;
     let mut applied_sigs = 0usize;
@@ -490,13 +586,26 @@ pub fn apply_hub_delta_to_pipeline(
         let Some(ip) = bytes_to_ip(&ip_delta.ip) else {
             continue;
         };
-        if pipeline.store.check_ip(&ip).is_some() {
+        if let Some(existing) = pipeline.store.check_ip(&ip) {
+            // A persisted decision is desired state, not proof that the kernel
+            // accepted a previous command. Reconcile it on every snapshot retry.
+            let ttl = (existing.expires_at - chrono::Utc::now()).num_seconds();
+            if ttl > 0 {
+                new_fw_entries.push((ip, ttl as u64));
+            }
             continue;
         }
         let threat_proto = ThreatClassProto::try_from(ip_delta.threat)
             .unwrap_or(ThreatClassProto::ThreatClassUnspecified);
         let threat_str = proto_to_threat_str(threat_proto).to_string();
-        let ttl = (ip_delta.ttl_secs as u64).max(60);
+        let remaining = chrono::DateTime::from_timestamp(ip_delta.expires_at_unix_secs, 0)
+            .map(|deadline| (deadline - chrono::Utc::now()).num_seconds())
+            .unwrap_or(0);
+        // Legacy deltas without an absolute expiry cannot safely be replayed.
+        if remaining <= 0 {
+            continue;
+        }
+        let ttl = remaining as u64;
 
         pipeline.store.upsert_ban(
             ip,
@@ -525,7 +634,7 @@ pub fn apply_hub_delta_to_pipeline(
 
     // Apply all newly learned Hub IPs in a single batched OS firewall invocation
     if !new_fw_entries.is_empty() {
-        let _ = pipeline.firewall.ban_ips_batch(&new_fw_entries);
+        pipeline.firewall.ban_ips_batch(&new_fw_entries)?;
     }
 
     Ok((applied_ips, applied_sigs))
@@ -550,6 +659,7 @@ pub async fn push_verdicts_via_grpc(
 pub async fn pull_and_apply_via_grpc(
     endpoint: &str,
     node_id: &str,
+    api_token: &str,
     since_seq: u64,
     pipeline: &SecurityPipeline,
 ) -> Result<(u64, usize, usize)> {
@@ -557,14 +667,110 @@ pub async fn pull_and_apply_via_grpc(
         .await
         .with_context(|| format!("Failed to connect to CustosHub gRPC server at {endpoint}"))?;
     let resp = client
-        .pull_deltas(Request::new(PullRequest {
-            node_id: node_id.to_string(),
-            since_seq,
-        }))
+        .pull_deltas(authenticated_request(
+            PullRequest {
+                node_id: node_id.to_string(),
+                since_seq,
+            },
+            node_id,
+            api_token,
+        )?)
         .await?;
     let delta = resp.into_inner();
     let (ips, sigs) = apply_hub_delta_to_pipeline(pipeline, &delta)?;
     Ok((delta.latest_seq, ips, sigs))
+}
+
+fn authenticated_request<T>(body: T, node_id: &str, token: &str) -> Result<Request<T>> {
+    let mut request = Request::new(body);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}")
+            .parse()
+            .context("Invalid Hub token metadata")?,
+    );
+    request.metadata_mut().insert(
+        "x-custos-node",
+        node_id
+            .parse()
+            .context("Invalid Hub node identity metadata")?,
+    );
+    Ok(request)
+}
+
+/// Reconnects until the producer closes or this future is cancelled. Outbound
+/// batches stay pending until PushSignals acknowledges them. Duplicate retries
+/// are safe because votes are sets of authenticated identities.
+pub async fn run_hub_sync(
+    endpoint: String,
+    node_id: String,
+    api_token: String,
+    pipeline: SecurityPipeline,
+    mut signals: mpsc::Receiver<SignalBatch>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !api_token.is_empty(),
+        "Configure hub.api_token before connecting to the Hub"
+    );
+    authenticated_request((), &node_id, &api_token)?;
+    let endpoint = tonic::transport::Endpoint::from_shared(endpoint)?
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10));
+    let mut pending: Option<SignalBatch> = None;
+    let mut retry_delay = Duration::from_millis(100);
+    loop {
+        if signals.is_closed() && signals.is_empty() && pending.is_none() {
+            return Ok(());
+        }
+        let result = async {
+            let channel = endpoint.connect().await?;
+            let mut client = CustosHubServiceClient::new(channel);
+            let (handshake_tx, handshake_rx) = mpsc::channel(1);
+            handshake_tx.send(NodeStreamMessage { node_id: node_id.clone(), since_seq: 0, signals: None }).await?;
+            let request = authenticated_request(ReceiverStream::new(handshake_rx), &node_id, &api_token)?;
+            let mut inbound = client.stream_intel(request).await?.into_inner();
+            // Keep the outgoing half open until the session ends.
+            let _handshake_tx = handshake_tx;
+            loop {
+                if let Some(batch) = pending.as_ref() {
+                    let mut batch = batch.clone();
+                    batch.node_id = node_id.clone();
+                    batch.api_token = api_token.clone();
+                    client.push_signals(Request::new(batch)).await?;
+                    pending = None;
+                }
+                tokio::select! {
+                    delta = inbound.message() => {
+                        let delta = delta?.context("Hub stream closed")?;
+                        let pipeline = pipeline.clone();
+                        tokio::task::spawn_blocking(move || apply_hub_delta_to_pipeline(&pipeline, &delta)).await??;
+                        retry_delay = Duration::from_millis(100);
+                    },
+                    batch = signals.recv() => match batch {
+                        Some(batch) => pending = Some(batch),
+                        None => return Ok::<bool, anyhow::Error>(true),
+                    }
+                }
+            }
+        }.await;
+        match result {
+            Ok(true) => return Ok(()),
+            Err(error) => {
+                if error.downcast_ref::<Status>().is_some_and(|status| {
+                    matches!(
+                        status.code(),
+                        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                    )
+                }) {
+                    return Err(error).context("Hub credentials were rejected");
+                }
+                warn!(%error, "Hub connection interrupted; retaining pending signals and reconnecting")
+            }
+            _ => {}
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+    }
 }
 
 #[cfg(test)]

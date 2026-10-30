@@ -1,16 +1,16 @@
 use crate::SecurityPipeline;
 use crate::tailer::AccessLogEvent;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Embedded Axum middleware function that integrates `Custos` (`SecurityPipeline`) directly
 /// into an application's HTTP request pipeline:
-/// 1. Extracts the client IP from `X-Real-IP` or `X-Forwarded-For` (falling back to `127.0.0.1`).
+/// 1. Uses the socket peer, accepting forwarded identity only from configured proxies.
 /// 2. Checks `DecisionStore::check_ip` in sub-microsecond time and short-circuits with `403 Forbidden`
 ///    (plus `x-custos-threat` header) if the IP is actively banned.
 /// 3. Executes the downstream handler, then feeds the resulting `AccessLogEvent` asynchronously
@@ -20,7 +20,13 @@ pub async fn custos_bouncer_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let client_ip = extract_client_ip(&req);
+    let Some(client_ip) = extract_client_ip(&req, &pipeline.trusted_proxies) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Missing connection identity or invalid forwarding header",
+        )
+            .into_response();
+    };
 
     // 1. Sub-microsecond check against active bans
     if let Some(decision) = pipeline.store.check_ip(&client_ip) {
@@ -56,6 +62,14 @@ pub async fn custos_bouncer_middleware(
         .unwrap_or("-")
         .to_string();
 
+    // Reserve capacity before downstream side effects; never block a Tokio worker.
+    let Ok(permit) = pipeline.reserve_event() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Security ingestion queue unavailable",
+        )
+            .into_response();
+    };
     // 2. Run downstream handler
     let response = next.run(req).await;
     let status = response.status().as_u16();
@@ -72,23 +86,37 @@ pub async fn custos_bouncer_middleware(
         referer,
         user_agent,
     };
-    let _ = pipeline.process_event(&ev);
+    permit.send(ev);
 
     response
 }
 
-fn extract_client_ip(req: &Request<Body>) -> IpAddr {
+fn extract_client_ip(req: &Request<Body>, trusted: &[IpAddr]) -> Option<IpAddr> {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>()?.0.ip();
+    if !trusted.contains(&peer) {
+        return Some(peer);
+    }
     let headers = req.headers();
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
-        && let Ok(ip) = real_ip.trim().parse::<IpAddr>()
-    {
-        return ip;
+    if headers.contains_key("x-forwarded-for") {
+        let mut chain = Vec::<IpAddr>::new();
+        for field in headers.get_all("x-forwarded-for") {
+            for part in field.to_str().ok()?.split(',') {
+                chain.push(part.trim().parse().ok()?);
+            }
+        }
+        // Walk away from the authenticated proxy; ignore spoofed leftmost entries.
+        return chain
+            .iter()
+            .rev()
+            .find(|ip| !trusted.contains(ip))
+            .copied()
+            .or_else(|| chain.first().copied());
     }
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
-        && let Some(first) = xff.split(',').next()
-        && let Ok(ip) = first.trim().parse::<IpAddr>()
-    {
-        return ip;
+    if headers.get_all("x-real-ip").iter().count() > 1 {
+        return None;
     }
-    IpAddr::from([127, 0, 0, 1])
+    if let Some(real) = headers.get("x-real-ip") {
+        return real.to_str().ok()?.trim().parse().ok();
+    }
+    Some(peer)
 }

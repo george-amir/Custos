@@ -120,6 +120,10 @@ impl JevBatchAnalyzer {
         })
     }
 
+    pub fn max_actors_per_batch(&self) -> usize {
+        self.cfg.max_actors_per_batch.max(1)
+    }
+
     pub fn is_mock(&self) -> bool {
         self.mock_mode
     }

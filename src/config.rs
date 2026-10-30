@@ -1,6 +1,8 @@
 use crate::firewall::FirewallBackend;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -21,6 +23,9 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubConfig {
+    /// Hub-side node identities mapped to distinct credentials.
+    #[serde(default)]
+    pub node_tokens: BTreeMap<String, String>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_hub_endpoint")]
@@ -49,6 +54,9 @@ pub struct FirewallConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
+    /// Exact proxy peer addresses allowed to supply forwarding headers.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
     #[serde(default = "default_bouncer_listen")]
     pub bouncer_listen: String,
     #[serde(default = "default_decisions_file")]
@@ -188,6 +196,7 @@ fn default_timeout_ms() -> u64 {
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
+            node_tokens: BTreeMap::new(),
             enabled: false,
             endpoint: default_hub_endpoint(),
             listen: default_hub_listen(),
@@ -212,6 +221,7 @@ impl Default for FirewallConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            trusted_proxies: Vec::new(),
             bouncer_listen: default_bouncer_listen(),
             decisions_file: default_decisions_file(),
             default_ban_ttl_secs: default_ban_ttl_secs(),

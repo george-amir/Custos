@@ -53,6 +53,7 @@ message IpBanDelta {
   float noul = 4;
   float confidence = 5;
   uint32 ttl_secs = 6;
+  int64 expires_at_unix_secs = 7; // Absolute expiry; required for safe replay.
 }
 
 message SignatureDelta {

@@ -1,7 +1,4 @@
-use crate::firewall::FirewallBouncer;
-use crate::jev::JevBatchAnalyzer;
-use crate::store::{BanDecision, DecisionSource, DecisionStore};
-use crate::window::SlidingWindowEngine;
+use crate::store::{BanDecision, DecisionSource};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -9,15 +6,43 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<DecisionStore>,
-    pub window: Arc<SlidingWindowEngine>,
-    pub jev: Arc<JevBatchAnalyzer>,
-    pub firewall: Arc<FirewallBouncer>,
+    pub pipeline: crate::SecurityPipeline,
+    pub api_token: String,
+}
+
+impl std::ops::Deref for AppState {
+    type Target = crate::SecurityPipeline;
+    fn deref(&self) -> &Self::Target {
+        &self.pipeline
+    }
+}
+
+async fn require_admin(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if state.api_token.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Admin API disabled: configure daemon.api_token",
+        )
+            .into_response();
+    }
+    let authorized = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_some_and(|token| token == state.api_token);
+    if !authorized {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,16 +108,20 @@ pub struct FirewallStatusResponse {
 }
 
 pub fn build_bouncer_router(state: AppState) -> Router {
+    let mutations = Router::new()
+        .route("/v1/decisions", axum::routing::post(handle_create_decision))
+        .route("/v1/decisions/{ip}", delete(handle_delete_decision))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
     Router::new()
         .route("/v1/bouncer/check", get(handle_bouncer_check))
-        .route(
-            "/v1/decisions",
-            get(handle_list_decisions).post(handle_create_decision),
-        )
-        .route("/v1/decisions/{ip}", delete(handle_delete_decision))
+        .route("/v1/decisions", get(handle_list_decisions))
         .route("/v1/firewall", get(handle_firewall_status))
         .route("/v1/stats", get(handle_stats))
         .route("/metrics", get(handle_prometheus_metrics))
+        .merge(mutations)
         .with_state(state)
 }
 
@@ -187,9 +216,9 @@ async fn handle_create_decision(
     State(state): State<AppState>,
     Json(req): Json<ManualBanRequest>,
 ) -> Result<(StatusCode, Json<BanDecision>), (StatusCode, String)> {
-    let decision = state
-        .store
-        .upsert_ban(
+    let pipeline = state.pipeline.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        pipeline.record_ban(
             req.ip,
             req.threat_class,
             DecisionSource::ManualAdmin,
@@ -198,38 +227,33 @@ async fn handle_create_decision(
             req.reason,
             req.ttl_secs,
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let ttl = (decision.expires_at - decision.created_at)
-        .num_seconds()
-        .max(1) as u64;
-    let _ = state.firewall.ban_ip(req.ip, ttl);
-
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((StatusCode::CREATED, Json(decision)))
 }
 
 async fn handle_delete_decision(
     State(state): State<AppState>,
     Path(ip_str): Path<String>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let Ok(ip) = ip_str.parse::<IpAddr>() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "invalid IP address" })),
-        );
+        return (StatusCode::BAD_REQUEST, "Invalid IP address").into_response();
     };
-    let removed = state.store.remove_ban(&ip);
-    if removed {
-        let _ = state.firewall.unban_ip(ip);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ip": ip, "removed": true })),
+    let pipeline = state.pipeline.clone();
+    match tokio::task::spawn_blocking(move || pipeline.remove_ban(&ip)).await {
+        Ok(Ok(removed)) => (
+            if removed {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            Json(serde_json::json!({"ip": ip, "removed": removed})),
         )
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ip": ip, "removed": false })),
-        )
+            .into_response(),
+        Ok(Err(error)) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 

@@ -7,11 +7,9 @@ use custos::bouncer_api::{
 };
 use custos::config::{AppConfig, LogFormat, LogSourceConfig};
 use custos::firewall::{FirewallBackend, FirewallBouncer};
-use custos::hub::proto::NodeStreamMessage;
-use custos::hub::proto::custos_hub_service_client::CustosHubServiceClient;
 use custos::hub::{
-    CustosHubGrpcService, HubEngine, apply_hub_delta_to_pipeline, build_signal_batch_from_verdicts,
-    pull_and_apply_via_grpc, push_verdicts_via_grpc,
+    CustosHubGrpcService, HubEngine, build_signal_batch_from_verdicts, pull_and_apply_via_grpc,
+    push_verdicts_via_grpc,
 };
 use custos::jev::JevBatchAnalyzer;
 use custos::store::{BanDecision, DecisionStore};
@@ -22,9 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,6 +32,9 @@ struct Cli {
     /// Path to config.toml
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    #[arg(long, hide = true, global = true)]
+    windows_service: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -225,8 +224,22 @@ enum ServiceAction {
     Uninstall,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if std::env::args().any(|arg| arg == "--windows-service") {
+        custos::windows_service::dispatch(run_async_main)
+    } else {
+        run_async_main()
+    }
+}
+
+fn run_async_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -322,7 +335,7 @@ async fn main() -> Result<()> {
             }
             run_replay(cfg, &log, fmt, mock_jev).await
         }
-        Commands::Hub { listen, quorum } => run_hub_server(&listen, quorum).await,
+        Commands::Hub { listen, quorum } => run_hub_server(&listen, quorum, &cfg).await,
         Commands::HubSync {
             hub,
             since_seq,
@@ -345,8 +358,18 @@ async fn main() -> Result<()> {
             reason,
             ttl_secs,
             api_url,
-        } => cmd_ban(ip, threat, reason, ttl_secs, &api_url).await,
-        Commands::Unban { ip, api_url } => cmd_unban(ip, &api_url).await,
+        } => {
+            cmd_ban(
+                ip,
+                threat,
+                reason,
+                ttl_secs,
+                &api_url,
+                &cfg.daemon.api_token,
+            )
+            .await
+        }
+        Commands::Unban { ip, api_url } => cmd_unban(ip, &api_url, &cfg.daemon.api_token).await,
         Commands::Check { ip, api_url } => cmd_check(ip, &api_url).await,
         Commands::Stats { api_url } => cmd_stats(&api_url).await,
         Commands::Service { action } => match action {
@@ -384,7 +407,7 @@ fn cmd_init(output: &std::path::Path, firewall_live: bool) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let serialized = toml::to_string_pretty(&cfg)?;
-    std::fs::write(output, serialized)
+    custos::service::write_secret_file(output, serialized.as_bytes())
         .with_context(|| format!("Failed to write config to {}", output.display()))?;
 
     println!("=== Custos Zero-Config Initialization Complete ===");
@@ -423,12 +446,16 @@ fn parse_backend(s: &str) -> FirewallBackend {
     }
 }
 
-async fn run_hub_server(listen: &str, quorum: usize) -> Result<()> {
+async fn run_hub_server(listen: &str, quorum: usize, cfg: &AppConfig) -> Result<()> {
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("Invalid gRPC listen socket address: {listen}"))?;
     let engine = Arc::new(HubEngine::new(quorum));
-    let svc = CustosHubGrpcService::new(engine);
+    let svc = CustosHubGrpcService::with_auth(
+        engine,
+        cfg.hub.api_token.clone(),
+        cfg.hub.node_tokens.clone(),
+    )?;
 
     info!(
         listen = %addr,
@@ -453,10 +480,16 @@ async fn cmd_hub_sync(cfg: AppConfig, hub_endpoint: &str, since_seq: u64) -> Res
     let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), true)?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
     let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())?;
 
-    let (latest_seq, ips_applied, sigs_applied) =
-        pull_and_apply_via_grpc(hub_endpoint, &cfg.hub.node_id, since_seq, &pipeline).await?;
+    let (latest_seq, ips_applied, sigs_applied) = pull_and_apply_via_grpc(
+        hub_endpoint,
+        &cfg.hub.node_id,
+        &cfg.hub.api_token,
+        since_seq,
+        &pipeline,
+    )
+    .await?;
 
     println!(
         "=== CustosHub gRPC Delta Sync Complete (endpoint={}, since_seq={} -> latest_seq={}) ===",
@@ -488,115 +521,59 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
     let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), use_mock)?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
     let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())?;
 
-    // Sync any restored active bans from disk into the OS firewall in a single batch call on startup
-    let existing: Vec<(IpAddr, u64)> = store
-        .list_active()
-        .into_iter()
-        .map(|d| {
-            let ttl = (d.expires_at - chrono::Utc::now()).num_seconds().max(1) as u64;
-            (d.ip, ttl)
-        })
-        .collect();
-    if !existing.is_empty() {
-        let _ = firewall.ban_ips_batch(&existing);
-    }
-
-    // Background TTL expiry sweeper & persistence compaction task (runs every 60s)
-    let sweep_store = store.clone();
-    let sweep_fw = firewall.clone();
+    // Startup initialization already reconciles durable decisions. Retry failures later.
+    let sweep_pipeline = pipeline.clone();
     tokio::spawn(async move {
-        let mut sweep_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
-            sweep_ticker.tick().await;
-            let expired = sweep_store.sweep_expired();
-            if !expired.is_empty() {
-                for ip in &expired {
-                    let _ = sweep_fw.unban_ip(*ip);
+            ticker.tick().await;
+            let p = sweep_pipeline.clone();
+            match tokio::task::spawn_blocking(move || {
+                p.reconcile_firewall()?;
+                p.store.compact_persistence_file()
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                other => {
+                    error!(result = ?other, "Firewall reconciliation or compaction failed; will retry")
                 }
-                let _ = sweep_store.compact_persistence_file();
-                info!(
-                    expired_count = expired.len(),
-                    "Swept expired IP bans and compacted persistence store"
-                );
             }
         }
     });
 
-    // Optional bidirectional gRPC stream to CustosHub
-    let (hub_tx, mut hub_rx) = mpsc::channel(256);
+    let (hub_tx, hub_rx) = mpsc::channel(256);
     if cfg.hub.enabled {
-        let hub_endpoint = cfg.hub.endpoint.clone();
+        if cfg.hub.api_token.trim().is_empty() {
+            anyhow::bail!("Hub sync requires hub.api_token or CUSTOS_HUB_TOKEN");
+        }
+        let endpoint = cfg.hub.endpoint.clone();
         let node_id = cfg.hub.node_id.clone();
-        let stream_pipeline = pipeline.clone();
+        let token = cfg.hub.api_token.clone();
+        let sync_pipeline = pipeline.clone();
         tokio::spawn(async move {
-            match CustosHubServiceClient::connect(hub_endpoint.clone()).await {
-                Ok(mut client) => {
-                    let (outbound_tx, outbound_rx) = mpsc::channel(128);
-                    // Send initial handshake with since_seq = 0
-                    let _ = outbound_tx
-                        .send(NodeStreamMessage {
-                            node_id: node_id.clone(),
-                            since_seq: 0,
-                            signals: None,
-                        })
-                        .await;
-
-                    let forward_node_id = node_id.clone();
-                    tokio::spawn(async move {
-                        while let Some(batch) = hub_rx.recv().await {
-                            let msg = NodeStreamMessage {
-                                node_id: forward_node_id.clone(),
-                                since_seq: 0,
-                                signals: Some(batch),
-                            };
-                            if outbound_tx.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    match client.stream_intel(ReceiverStream::new(outbound_rx)).await {
-                        Ok(resp) => {
-                            info!(endpoint = %hub_endpoint, node_id = %node_id, "Connected to CustosHub bidirectional gRPC stream");
-                            let mut inbound = resp.into_inner();
-                            while let Some(Ok(delta)) = inbound.next().await {
-                                if let Ok((ips, sigs)) =
-                                    apply_hub_delta_to_pipeline(&stream_pipeline, &delta)
-                                    && (ips > 0 || sigs > 0)
-                                {
-                                    info!(
-                                        latest_seq = delta.latest_seq,
-                                        ips_applied = ips,
-                                        sigs_applied = sigs,
-                                        "Applied real-time gRPC HubDeltaBatch from CustosHub"
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "Failed to open CustosHub gRPC StreamIntel")
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(endpoint = %hub_endpoint, error = %err, "Could not connect to CustosHub gRPC server")
-                }
+            if let Err(error) =
+                custos::hub::run_hub_sync(endpoint, node_id, token, sync_pipeline, hub_rx).await
+            {
+                error!(%error, "Hub synchronization stopped");
             }
         });
     }
 
     let (tx, mut rx) = mpsc::channel(8192);
+    let mut tailer_tasks = Vec::new();
     for source in &cfg.logs {
         info!(path = %source.path.display(), format = ?source.format, "Tailing log source");
-        spawn_log_tailer(source.clone(), tx.clone(), from_start);
+        tailer_tasks.push(spawn_log_tailer(source.clone(), tx.clone(), from_start));
     }
 
+    drop(tx);
     let ingest_pipeline = pipeline.clone();
-    tokio::spawn(async move {
+    let ingest_task = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            if let Err(err) = ingest_pipeline.process_event(&ev) {
+            if let Err(err) = ingest_pipeline.submit_event(ev).await {
                 error!(error = %err, "Failed to process log event");
             }
         }
@@ -609,10 +586,15 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
     let api_token = cfg.hub.api_token.clone();
     let default_ttl = cfg.daemon.default_ban_ttl_secs;
 
-    tokio::spawn(async move {
+    let (stop_flush, mut flush_stopped) = tokio::sync::oneshot::channel();
+    let flush_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(flush_ms));
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = &mut flush_stopped => break,
+                _ = ticker.tick() => {}
+            }
             match flush_pipeline.flush_and_analyze(false).await {
                 Ok(verdicts) => {
                     if hub_enabled && !verdicts.is_empty() {
@@ -632,10 +614,8 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
 
     let shutdown_pipeline = pipeline.clone();
     let app_state = AppState {
-        store,
-        window,
-        jev,
-        firewall: firewall.clone(),
+        pipeline: pipeline.clone(),
+        api_token: cfg.daemon.api_token.clone(),
     };
     let router = build_bouncer_router(app_state);
     let listener = tokio::net::TcpListener::bind(&cfg.daemon.bouncer_listen)
@@ -657,10 +637,24 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
+            for task in &tailer_tasks {
+                task.abort();
+            }
+            for task in tailer_tasks {
+                let _ = task.await;
+            }
+            let _ = ingest_task.await;
+            // Finish any in-flight batch before the final forced drain.
+            let _ = stop_flush.send(());
+            let _ = flush_task.await;
             info!("Shutdown signal received; flushing pending windows and compacting store...");
-            let _ = shutdown_pipeline.flush_and_analyze(true).await;
-            let _ = shutdown_pipeline.store.compact_persistence_file();
+            if let Err(error) = shutdown_pipeline.flush_and_analyze(true).await {
+                error!(%error, "Final analysis failed during shutdown");
+            }
+            if let Err(error) = shutdown_pipeline.store.compact_persistence_file() {
+                error!(%error, "Final persistence compaction failed");
+            }
         })
         .await?;
     Ok(())
@@ -681,7 +675,7 @@ async fn run_replay(
     let jev = Arc::new(JevBatchAnalyzer::new(cfg.jev.clone(), use_mock)?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
     let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())?;
 
     let events = replay_log_file(log_path, format)?;
     println!(
@@ -888,6 +882,7 @@ async fn cmd_ban(
     reason: String,
     ttl_secs: Option<u64>,
     api_url: &str,
+    api_token: &str,
 ) -> Result<()> {
     let url = format!("{}/v1/decisions", api_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
@@ -897,7 +892,12 @@ async fn cmd_ban(
         reason,
         ttl_secs,
     };
-    let resp = client.post(&url).json(&payload).send().await?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_token)
+        .json(&payload)
+        .send()
+        .await?;
     let decision: BanDecision = resp.error_for_status()?.json().await?;
     println!(
         "Banned {} ({}) until {}",
@@ -906,10 +906,15 @@ async fn cmd_ban(
     Ok(())
 }
 
-async fn cmd_unban(ip: IpAddr, api_url: &str) -> Result<()> {
+async fn cmd_unban(ip: IpAddr, api_url: &str, api_token: &str) -> Result<()> {
     let url = format!("{}/v1/decisions/{}", api_url.trim_end_matches('/'), ip);
     let client = reqwest::Client::new();
-    let resp = client.delete(&url).send().await?;
+    let resp = client
+        .delete(&url)
+        .bearer_auth(api_token)
+        .send()
+        .await?
+        .error_for_status()?;
     println!("Unban {}: HTTP {}", ip, resp.status());
     Ok(())
 }
@@ -946,4 +951,26 @@ async fn cmd_stats(api_url: &str) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&fw)?);
     }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(windows)]
+    {
+        // SCM services have no console. A console-handler initialization error
+        // must not be mistaken for a service stop request.
+        if std::env::args_os().any(|arg| arg == "--windows-service") {
+            custos::windows_service::shutdown_requested().await;
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = tokio::signal::ctrl_c().await;
 }

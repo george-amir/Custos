@@ -27,3 +27,24 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run unit & integration tests (zero-protoc pure Rust build)
         run: cargo test --all-targets
+      - name: Exercise Windows SCM startup and graceful stop
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/windows-service-smoke.ps1
+
+  minimum-rust:
+    name: Minimum supported Rust (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  docker:
+    name: Container build and isolated enforcement smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t custos:ci .
+      - run: ./.github/scripts/docker-smoke.sh

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::{BTreeSet, HashSet};
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// High-value sensitive or exploit-probe path substrings that immediately raise L1 suspicion.
@@ -44,6 +45,8 @@ const SCANNER_UA_PATTERNS: &[&str] = &[
 /// Outcome of processing a single `AccessLogEvent` through the L1 engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum L1Disposition {
+    /// No additional IP can be admitted without exceeding the configured bound.
+    CapacityExceeded,
     /// Benign static asset or healthcheck; skipped to save memory and tokens.
     IgnoredStatic,
     /// Matched an auto-cached attack signature or volumetric flood threshold at L1.
@@ -99,6 +102,7 @@ impl IpWindowState {
 /// Telemetry counters for L1 filtering and windowing.
 #[derive(Debug, Default)]
 pub struct WindowMetrics {
+    pub capacity_dropped: AtomicU64,
     pub events_processed: AtomicU64,
     pub static_ignored: AtomicU64,
     pub l1_instant_bans: AtomicU64,
@@ -107,6 +111,7 @@ pub struct WindowMetrics {
 
 /// Manages per-IP sliding windows, L1 deterministic filtering, and auto-cached signatures.
 pub struct SlidingWindowEngine {
+    mutation: Mutex<()>,
     cfg: WindowConfig,
     windows: DashMap<IpAddr, IpWindowState>,
     /// Auto-synthesized signatures `(method, normalized_path_prefix)` learned from high-confidence Jev verdicts.
@@ -118,6 +123,7 @@ impl SlidingWindowEngine {
     pub fn new(cfg: WindowConfig) -> Self {
         Self {
             cfg,
+            mutation: Mutex::new(()),
             windows: DashMap::new(),
             auto_signatures: DashMap::new(),
             metrics: WindowMetrics::default(),
@@ -127,7 +133,7 @@ impl SlidingWindowEngine {
     /// Registers a high-confidence attack signature discovered by Jev so repeat probes
     /// from other botnet IPs can be blocked at L1 with zero AI token cost.
     pub fn register_auto_signature(&self, method: &str, path: &str, threat_class: &str) {
-        let prefix = normalize_path_prefix(path);
+        let prefix = path.trim().to_string();
         if prefix.len() >= 4 && prefix != "/" {
             self.auto_signatures
                 .insert((method.to_uppercase(), prefix), threat_class.to_string());
@@ -140,6 +146,7 @@ impl SlidingWindowEngine {
 
     /// Ingests one `AccessLogEvent` into the L1 filter and per-IP sliding window.
     pub fn ingest(&self, ev: &AccessLogEvent) -> L1Disposition {
+        let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
         self.metrics
             .events_processed
             .fetch_add(1, Ordering::Relaxed);
@@ -154,7 +161,7 @@ impl SlidingWindowEngine {
         }
 
         // 2. Check Auto-Cached Signatures from previous high-confidence Jev convictions
-        let path_prefix = normalize_path_prefix(&ev.path);
+        let path_prefix = ev.path.trim().to_string();
         if let Some(sig_threat) = self
             .auto_signatures
             .get(&(ev.method.to_uppercase(), path_prefix.clone()))
@@ -170,9 +177,15 @@ impl SlidingWindowEngine {
         }
 
         // 3. Enforce bounded memory cap (`max_tracked_ips`) against spoofed-IP floods
-        let max_ips = self.cfg.max_tracked_ips.max(64);
+        let max_ips = self.cfg.max_tracked_ips.max(1);
         if self.windows.len() >= max_ips && !self.windows.contains_key(&ev.client_ip) {
             self.evict_low_priority_windows(max_ips / 10 + 1);
+            if self.windows.len() >= max_ips {
+                self.metrics
+                    .capacity_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                return L1Disposition::CapacityExceeded;
+            }
         }
 
         // 4. Sanitize URI & User-Agent and extract structural signals
@@ -294,6 +307,7 @@ impl SlidingWindowEngine {
     /// or `force_all` is true), packing them into sanitized `ActorStateSummary` structs
     /// ready for a bulk Jev `/v1/systemone` request.
     pub fn drain_suspicious_summaries(&self, force_all: bool) -> Vec<ActorStateSummary> {
+        let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         let mut to_remove = Vec::new();
         let mut summaries = Vec::new();

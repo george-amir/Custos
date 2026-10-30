@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::LazyLock;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Normalized HTTP access log event produced by the tailer/parser.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,20 +114,71 @@ fn default_status() -> u16 {
     200
 }
 
+#[derive(Deserialize)]
+struct CaddyLog {
+    ts: Option<f64>,
+    request: CaddyRequest,
+    status: u16,
+    #[serde(default)]
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct CaddyRequest {
+    remote_ip: String,
+    #[serde(default)]
+    client_ip: String,
+    method: String,
+    uri: String,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, Vec<String>>,
+}
+
 fn parse_json_log(line: &str) -> Option<AccessLogEvent> {
-    let raw: RawJsonLog = serde_json::from_str(line).ok()?;
-    let client_ip: IpAddr = raw.client_ip.parse().ok()?;
-    let (path, query) = split_uri(&raw.uri);
+    if let Ok(raw) = serde_json::from_str::<RawJsonLog>(line) {
+        let (path, query) = split_uri(&raw.uri);
+        return Some(AccessLogEvent {
+            timestamp: Utc::now(),
+            client_ip: raw.client_ip.parse().ok()?,
+            method: raw.method,
+            path,
+            query,
+            status: raw.status,
+            bytes_sent: raw.bytes_sent,
+            referer: raw.referer,
+            user_agent: raw.user_agent,
+        });
+    }
+    let raw: CaddyLog = serde_json::from_str(line).ok()?;
+    let header = |name: &str| {
+        raw.request
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, values)| values.first())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (path, query) = split_uri(&raw.request.uri);
+    let client = if raw.request.client_ip.is_empty() {
+        &raw.request.remote_ip
+    } else {
+        &raw.request.client_ip
+    };
     Some(AccessLogEvent {
-        timestamp: Utc::now(),
-        client_ip,
-        method: raw.method,
+        timestamp: raw
+            .ts
+            .filter(|v| v.is_finite())
+            .and_then(|v| DateTime::from_timestamp_millis((v * 1000.0) as i64))
+            .unwrap_or_else(Utc::now),
+        client_ip: client.parse().ok()?,
+        method: raw.request.method.clone(),
         path,
         query,
         status: raw.status,
-        bytes_sent: raw.bytes_sent,
-        referer: raw.referer,
-        user_agent: raw.user_agent,
+        bytes_sent: raw.size,
+        referer: header("referer"),
+        user_agent: header("user-agent"),
     })
 }
 
@@ -146,67 +197,165 @@ pub fn replay_log_file(path: &Path, format: LogFormat) -> Result<Vec<AccessLogEv
     Ok(events)
 }
 
-/// Spawns a background task that tails `source.path` (similar to `tail -F`),
-/// handling file truncation/rotation and streaming parsed `AccessLogEvent`s.
+#[derive(Default)]
+struct TailCursor {
+    offset: u64,
+    identity: Option<(u64, u64)>,
+}
+
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct FileInfo {
+        attributes: u32,
+        creation: FileTime,
+        access: FileTime,
+        write: FileTime,
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut FileInfo) -> i32;
+    }
+    let mut info = std::mem::MaybeUninit::<FileInfo>::uninit();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok((
+        info.volume as u64,
+        ((info.index_high as u64) << 32) | info.index_low as u64,
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    let created = file
+        .metadata()?
+        .created()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok((created.as_secs(), created.subsec_nanos() as u64))
+}
+
+fn read_available(
+    source: &LogSourceConfig,
+    cursor: &mut TailCursor,
+    from_start: bool,
+) -> Result<Vec<AccessLogEvent>> {
+    let mut file = std::fs::File::open(&source.path)?;
+    let identity = file_identity(&file)?;
+    let len = file.metadata()?.len();
+    match cursor.identity {
+        None => cursor.offset = if from_start { 0 } else { len },
+        Some(previous) if previous != identity || len < cursor.offset => cursor.offset = 0,
+        _ => {}
+    }
+    cursor.identity = Some(identity);
+    file.seek(SeekFrom::Start(cursor.offset))?;
+    let mut reader = BufReader::new(file);
+    read_records(source, cursor, &mut reader)
+}
+
+fn read_records(
+    source: &LogSourceConfig,
+    cursor: &mut TailCursor,
+    reader: &mut impl BufRead,
+) -> Result<Vec<AccessLogEvent>> {
+    let mut events = Vec::new();
+    // Limit each filesystem operation so cancellation/backpressure stays responsive.
+    for _ in 0..256 {
+        let mut record = Vec::new();
+        let bytes = match reader.read_until(b'\n', &mut record) {
+            Ok(bytes) => bytes,
+            Err(error) if events.is_empty() => return Err(error.into()),
+            Err(error) => {
+                // Already committed records must still reach the consumer. The
+                // failed record's offset is unchanged, so the next poll retries it.
+                warn!(path = %source.path.display(), offset = cursor.offset, %error, "Read interrupted; delivering complete records before retry");
+                break;
+            }
+        };
+        if bytes == 0 || !record.ends_with(b"\n") {
+            break;
+        }
+        cursor.offset += bytes as u64;
+        let Ok(line) = std::str::from_utf8(&record) else {
+            warn!(path = %source.path.display(), offset = cursor.offset, "Skipped access log record with invalid UTF-8");
+            continue;
+        };
+        if let Some(event) = parse_log_line(line, source.format) {
+            events.push(event);
+        } else if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            warn!(path = %source.path.display(), offset = cursor.offset, "Skipped malformed access log record");
+        }
+    }
+    Ok(events)
+}
+
+/// Follow replacement files by identity and consume only complete records.
 pub fn spawn_log_tailer(
     source: LogSourceConfig,
     tx: mpsc::Sender<AccessLogEvent>,
     read_from_start: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut offset: u64 = 0;
-        let mut initialized = false;
-
+        let mut cursor = TailCursor::default();
         loop {
-            match std::fs::File::open(&source.path) {
-                Ok(mut file) => {
-                    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    if !initialized {
-                        offset = if read_from_start { 0 } else { file_len };
-                        initialized = true;
-                        debug!(
-                            path = %source.path.display(),
-                            offset,
-                            "Initialized log tailer"
-                        );
-                    } else if file_len < offset {
-                        // Log file was truncated or rotated
-                        debug!(
-                            path = %source.path.display(),
-                            old_offset = offset,
-                            new_len = file_len,
-                            "Detected log truncation/rotation; resetting offset to 0"
-                        );
-                        offset = 0;
-                    }
-
-                    if file.seek(SeekFrom::Start(offset)).is_ok() {
-                        let mut reader = BufReader::new(file);
-                        let mut line = String::new();
-                        while let Ok(bytes_read) = reader.read_line(&mut line) {
-                            if bytes_read == 0 {
-                                break;
-                            }
-                            offset += bytes_read as u64;
-                            if let Some(ev) = parse_log_line(&line, source.format)
-                                && tx.send(ev).await.is_err()
-                            {
-                                return;
-                            }
-                            line.clear();
+            if tx.is_closed() {
+                return;
+            }
+            let input = source.clone();
+            let (next_cursor, result) = match tokio::task::spawn_blocking(move || {
+                let result = read_available(&input, &mut cursor, read_from_start);
+                (cursor, result)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(%error, "Log reader worker failed");
+                    return;
+                }
+            };
+            cursor = next_cursor;
+            let mut full = false;
+            match result {
+                Ok(events) => {
+                    full = events.len() == 256;
+                    for event in events {
+                        if tx.send(event).await.is_err() {
+                            return;
                         }
                     }
                 }
-                Err(err) => {
-                    warn!(
-                        path = %source.path.display(),
-                        error = %err,
-                        "Waiting for log file to become available"
-                    );
+                Err(error) => {
+                    warn!(path = %source.path.display(), %error, "Unable to read log source; will retry")
                 }
             }
-
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if full {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
         }
     })
 }
@@ -214,6 +363,41 @@ pub fn spawn_log_tailer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_error_preserves_complete_records_and_retries_partial_record() {
+        struct InterruptedReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for InterruptedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = std::io::Read::read(&mut self.bytes, buffer)?;
+                if count == 0 {
+                    return Err(std::io::Error::other("injected read failure"));
+                }
+                Ok(count)
+            }
+        }
+        let complete = b"{\"client_ip\":\"198.51.100.1\",\"uri\":\"/complete\"}\n";
+        let mut bytes = complete.to_vec();
+        bytes.extend_from_slice(b"{\"client_ip\":");
+        let mut reader = BufReader::new(InterruptedReader {
+            bytes: std::io::Cursor::new(bytes),
+        });
+        let source = LogSourceConfig {
+            path: "unused".into(),
+            format: LogFormat::Json,
+        };
+        let mut cursor = TailCursor::default();
+        let events = read_records(&source, &mut cursor, &mut reader).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "/complete");
+        assert_eq!(
+            cursor.offset,
+            complete.len() as u64,
+            "retry starts at the partial record"
+        );
+    }
 
     #[test]
     fn test_parse_nginx_combined_line() {

@@ -1,8 +1,168 @@
 use crate::config::{AppConfig, LogFormat, LogSourceConfig};
 use crate::firewall::FirewallBackend;
 use anyhow::{Context, Result, bail};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SECRET_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes credentials without exposing a readable intermediate file.
+/// Replacing an existing file also tightens permissions left by older versions.
+pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .context("Secret file must have a filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SECRET_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = create_private_file(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        replace_private_file(&temporary, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("Failed to securely write {}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_file(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Private credential files are not supported on this platform",
+    ))
+}
+
+#[cfg(not(windows))]
+fn replace_private_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+mod private_files {
+    use std::{
+        ffi::c_void,
+        os::windows::{ffi::OsStrExt, io::FromRawHandle},
+        path::Path,
+    };
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        descriptor: *mut c_void,
+        inherit: i32,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            descriptor: *mut *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            path: *const u16,
+            access: u32,
+            sharing: u32,
+            attributes: *const SecurityAttributes,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+        fn MoveFileExW(source: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+    pub(super) fn create(path: &Path) -> std::io::Result<std::fs::File> {
+        // Protected DACL: SYSTEM, Administrators and the file owner only.
+        let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = std::ptr::null_mut();
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let attrs = SecurityAttributes {
+                length: std::mem::size_of::<SecurityAttributes>() as u32,
+                descriptor,
+                inherit: 0,
+            };
+            let handle = CreateFileW(
+                wide(path).as_ptr(),
+                0x40000000,
+                0,
+                &attrs,
+                1,
+                0x80,
+                std::ptr::null_mut(),
+            );
+            let error = std::io::Error::last_os_error();
+            LocalFree(descriptor);
+            if handle as isize == -1 {
+                Err(error)
+            } else {
+                Ok(std::fs::File::from_raw_handle(handle))
+            }
+        }
+    }
+    pub(super) fn replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+        // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH; the private DACL follows the file.
+        if unsafe { MoveFileExW(wide(source).as_ptr(), wide(destination).as_ptr(), 0x9) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    private_files::create(path)
+}
+
+#[cfg(windows)]
+fn replace_private_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    private_files::replace(source, destination)
+}
 
 /// Supported native OS service managers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +245,8 @@ pub fn generate_launchd_plist(
     config_path: &Path,
     work_dir: &Path,
     log_dir: &Path,
-    typesafe_api_key: Option<&str>,
+    _typesafe_api_key: Option<&str>,
 ) -> String {
-    let api_key_val = typesafe_api_key.unwrap_or("");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -108,8 +267,6 @@ pub fn generate_launchd_plist(
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
-        <key>TYPESAFE_API_KEY</key>
-        <string>{api_key}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -123,27 +280,29 @@ pub fn generate_launchd_plist(
 </plist>
 "#,
         label = MACOS_PLIST_LABEL,
-        bin_path = bin_path.display(),
-        config_path = config_path.display(),
-        work_dir = work_dir.display(),
-        api_key = api_key_val,
-        log_dir = log_dir.display(),
+        bin_path = xml_escape(&bin_path.to_string_lossy()),
+        config_path = xml_escape(&config_path.to_string_lossy()),
+        work_dir = xml_escape(&work_dir.to_string_lossy()),
+        log_dir = xml_escape(&log_dir.to_string_lossy()),
     )
 }
 
 /// Generates the Windows `sc.exe` command arguments to register `Custos` as an auto-start service.
 pub fn generate_windows_sc_create_args(bin_path: &Path, config_path: &Path) -> Vec<String> {
     let bin_arg = format!(
-        "\"{}\" --config \"{}\" run",
+        "\"{}\" --windows-service --config \"{}\" run",
         bin_path.display(),
         config_path.display()
     );
     vec![
         "create".to_string(),
         "Custos".to_string(),
-        format!("binPath= {bin_arg}"),
-        "start= auto".to_string(),
-        "DisplayName= \"Custos Behavioral Security & Firewall Bouncer\"".to_string(),
+        "binPath=".to_string(),
+        bin_arg,
+        "start=".to_string(),
+        "auto".to_string(),
+        "DisplayName=".to_string(),
+        "Custos Behavioral Security & Firewall Bouncer".to_string(),
     ]
 }
 
@@ -207,17 +366,10 @@ pub fn install_service(live_firewall: bool, dry_run: bool) -> Result<()> {
                 );
             }
             ServicePlatform::Launchd => {
-                let api_key = std::env::var("TYPESAFE_API_KEY").ok();
                 println!(
                     "--- {} ---\n{}",
                     MACOS_PLIST_PATH,
-                    generate_launchd_plist(
-                        &target_bin,
-                        &config_path,
-                        &work_dir,
-                        &log_dir,
-                        api_key.as_deref()
-                    )
+                    generate_launchd_plist(&target_bin, &config_path, &work_dir, &log_dir, None)
                 );
             }
             ServicePlatform::WindowsSc => {
@@ -240,9 +392,11 @@ pub fn install_service(live_firewall: bool, dry_run: bool) -> Result<()> {
 
     if !config_path.exists() {
         let toml_str = toml::to_string_pretty(&cfg)?;
-        std::fs::write(&config_path, toml_str)?;
+        write_secret_file(&config_path, toml_str.as_bytes())?;
         println!("  Created Config       : {}", config_path.display());
     } else {
+        // Repair permissions on credentials created by older installers.
+        write_secret_file(&config_path, &std::fs::read(&config_path)?)?;
         println!(
             "  Preserved Config     : {} (already exists)",
             config_path.display()
@@ -270,9 +424,9 @@ pub fn install_service(live_firewall: bool, dry_run: bool) -> Result<()> {
     match platform {
         ServicePlatform::Systemd => {
             if !env_file.exists() {
-                let api_key = std::env::var("TYPESAFE_API_KEY").unwrap_or_default();
-                let env_contents = format!("TYPESAFE_API_KEY={api_key}\nRUST_LOG=info\n");
-                std::fs::write(&env_file, env_contents)?;
+                write_secret_file(&env_file, b"RUST_LOG=info\n")?;
+            } else {
+                write_secret_file(&env_file, &std::fs::read(&env_file)?)?;
             }
             let unit = generate_systemd_unit(&target_bin, &config_path, &work_dir, &env_file);
             std::fs::write(LINUX_UNIT_PATH, unit)
@@ -283,20 +437,14 @@ pub fn install_service(live_firewall: bool, dry_run: bool) -> Result<()> {
         }
         ServicePlatform::Launchd => {
             std::fs::create_dir_all(&log_dir)?;
-            let api_key = std::env::var("TYPESAFE_API_KEY").ok();
-            let plist = generate_launchd_plist(
-                &target_bin,
-                &config_path,
-                &work_dir,
-                &log_dir,
-                api_key.as_deref(),
-            );
+            let plist =
+                generate_launchd_plist(&target_bin, &config_path, &work_dir, &log_dir, None);
             std::fs::write(MACOS_PLIST_PATH, plist)
                 .with_context(|| format!("Failed to write {MACOS_PLIST_PATH} (run with sudo)"))?;
             let _ = Command::new("launchctl")
-                .args(["unload", MACOS_PLIST_PATH])
+                .args(["bootout", &format!("system/{MACOS_PLIST_LABEL}")])
                 .output();
-            run_cmd("launchctl", &["load", "-w", MACOS_PLIST_PATH])?;
+            run_cmd("launchctl", &["bootstrap", "system", MACOS_PLIST_PATH])?;
             println!(
                 "  Service Status       : loaded & started via launchd ({})",
                 MACOS_PLIST_LABEL
@@ -315,20 +463,50 @@ pub fn install_service(live_firewall: bool, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Command plans are shared by execution and tests; stopping launchd unloads
+/// the job so its KeepAlive policy cannot immediately restart it.
+pub fn service_control_command(
+    platform: ServicePlatform,
+    start: bool,
+) -> (&'static str, Vec<String>) {
+    let (program, args): (&str, Vec<&str>) = match (platform, start) {
+        (ServicePlatform::Systemd, true) => ("systemctl", vec!["start", "custos"]),
+        (ServicePlatform::Systemd, false) => ("systemctl", vec!["stop", "custos"]),
+        (ServicePlatform::Launchd, true) => {
+            ("launchctl", vec!["bootstrap", "system", MACOS_PLIST_PATH])
+        }
+        (ServicePlatform::Launchd, false) => {
+            ("launchctl", vec!["bootout", "system/ai.typesafe.custos"])
+        }
+        (ServicePlatform::WindowsSc, true) => ("sc.exe", vec!["start", "Custos"]),
+        (ServicePlatform::WindowsSc, false) => ("sc.exe", vec!["stop", "Custos"]),
+    };
+    (program, args.into_iter().map(String::from).collect())
+}
+
 pub fn start_service() -> Result<()> {
-    match ServicePlatform::detect() {
-        ServicePlatform::Systemd => run_cmd("systemctl", &["start", "custos"]),
-        ServicePlatform::Launchd => run_cmd("launchctl", &["start", MACOS_PLIST_LABEL]),
-        ServicePlatform::WindowsSc => run_cmd("sc.exe", &["start", "Custos"]),
-    }
+    let (program, args) = service_control_command(ServicePlatform::detect(), true);
+    run_cmd(
+        program,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
 }
 
 pub fn stop_service() -> Result<()> {
-    match ServicePlatform::detect() {
-        ServicePlatform::Systemd => run_cmd("systemctl", &["stop", "custos"]),
-        ServicePlatform::Launchd => run_cmd("launchctl", &["stop", MACOS_PLIST_LABEL]),
-        ServicePlatform::WindowsSc => run_cmd("sc.exe", &["stop", "Custos"]),
-    }
+    let (program, args) = service_control_command(ServicePlatform::detect(), false);
+    run_cmd(
+        program,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
 }
 
 pub fn uninstall_service() -> Result<()> {
@@ -343,7 +521,7 @@ pub fn uninstall_service() -> Result<()> {
         }
         ServicePlatform::Launchd => {
             if Path::new(MACOS_PLIST_PATH).exists() {
-                let _ = run_cmd("launchctl", &["unload", "-w", MACOS_PLIST_PATH]);
+                let _ = run_cmd("launchctl", &["bootout", "system/ai.typesafe.custos"]);
                 std::fs::remove_file(MACOS_PLIST_PATH)?;
             }
             println!("Removed macOS LaunchDaemon {MACOS_PLIST_PATH}");
@@ -440,7 +618,7 @@ mod tests {
         );
         assert!(plist.contains("<string>ai.typesafe.custos</string>"));
         assert!(plist.contains("<string>/usr/local/bin/custos</string>"));
-        assert!(plist.contains("<string>ts_test_123</string>"));
+        assert!(!plist.contains("ts_test_123"));
 
         let win_args = generate_windows_sc_create_args(
             Path::new("C:\\Program Files\\Custos\\custos.exe"),

@@ -1,0 +1,20 @@
+# Runtime configuration for the documented host-network container deployment.
+# Mount web-server logs at /var/log/nginx and state at /var/lib/custos.
+# Pass TYPESAFE_API_KEY and CUSTOS_API_TOKEN through the environment.
+[daemon]
+bouncer_listen = "127.0.0.1:8085"
+decisions_file = "/var/lib/custos/decisions.jsonl"
+default_ban_ttl_secs = 3600
+
+[[logs]]
+path = "/var/log/nginx/access.log"
+format = "nginx_combined"
+
+[firewall]
+enabled = true
+backend = "nftables"
+dry_run = false
+table_name = "custos_block"
+
+[hub]
+enabled = false

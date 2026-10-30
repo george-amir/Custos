@@ -4,9 +4,13 @@
 bouncer_listen = "127.0.0.1:8085"
 decisions_file = "decisions.jsonl"
 default_ban_ttl_secs = 3600
-# Optional Bearer token required for mutating API endpoints (POST/DELETE /v1/decisions)
+# Bearer token required for mutating API endpoints (POST/DELETE /v1/decisions).
+# Empty disables admin mutations (503); read-only bouncer checks remain available.
 # Can also be set via CUSTOS_API_TOKEN environment variable
 api_token = ""
+# Embedded middleware only: exact socket peers permitted to supply forwarded IPs.
+# Forwarding headers from other peers are ignored.
+trusted_proxies = []
 
 [[logs]]
 path = "tests/fixtures/sample_access.log"
@@ -59,8 +63,14 @@ enabled = false
 endpoint = "http://127.0.0.1:50051"
 listen = "127.0.0.1:50051"
 node_id = "custos-node-1"
-# Optional shared token for authenticating PushSignals / StreamIntel RPCs (or CUSTOS_HUB_TOKEN env)
+# Node credential (or CUSTOS_HUB_TOKEN env); Hub server requires credentials.
+# A server-side shared token counts as one identity, regardless of node_id.
 api_token = ""
 # Minimum distinct reporting nodes required to promote an IP or signature globally
 # (1 = trusted private fleet, 3+ = untrusted community quorum)
 quorum_min_nodes = 1
+
+# Hub server only: use distinct credentials for independent quorum votes.
+# [hub.node_tokens]
+# edge_eu = "replace-with-unique-secret"
+# edge_us = "replace-with-another-unique-secret"

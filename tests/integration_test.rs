@@ -28,7 +28,8 @@ async fn test_full_pipeline_and_bouncer_api_end_to_end() {
     let jev = Arc::new(JevBatchAnalyzer::new(JevConfig::default(), true).unwrap());
     let firewall = Arc::new(FirewallBouncer::new(FirewallConfig::default()));
     let pipeline =
-        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone());
+        SecurityPipeline::new(store.clone(), window.clone(), jev.clone(), firewall.clone())
+            .unwrap();
 
     let events = replay_log_file(
         Path::new("tests/fixtures/sample_access.log"),
@@ -65,10 +66,8 @@ async fn test_full_pipeline_and_bouncer_api_end_to_end() {
 
     // Build the Bouncer HTTP API router
     let router = build_bouncer_router(AppState {
-        store: store.clone(),
-        window: window.clone(),
-        jev: jev.clone(),
-        firewall: firewall.clone(),
+        pipeline: pipeline.clone(),
+        api_token: "test-admin-token".into(),
     });
 
     // 1. Benign user IP (192.0.2.10) should be ALLOWED (200 OK)
@@ -191,7 +190,12 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
 
     // 1. Initialize the gRPC CustosHub service
     let hub_engine = Arc::new(HubEngine::new(1));
-    let hub_grpc = CustosHubGrpcService::new(hub_engine.clone());
+    let hub_grpc = CustosHubGrpcService::with_auth(
+        hub_engine.clone(),
+        "test-hub-token".into(),
+        Default::default(),
+    )
+    .unwrap();
 
     // 2. Node A processes `sample_access.log` and pushes its Jev verdicts + L1 signatures to CustosHub via gRPC `push_signals`
     let dir_a = tempdir().unwrap();
@@ -210,7 +214,8 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
         pipeline_a.process_event(ev).unwrap();
     }
     let verdicts_a = pipeline_a.flush_and_analyze(true).await.unwrap();
-    let signal_batch = build_signal_batch_from_verdicts("node-a", "", &verdicts_a, 3600);
+    let signal_batch =
+        build_signal_batch_from_verdicts("node-a", "test-hub-token", &verdicts_a, 3600);
 
     let ack = hub_grpc
         .push_signals(tonic::Request::new(signal_batch))
@@ -218,8 +223,8 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
         .unwrap()
         .into_inner();
     assert_eq!(ack.accepted_ips, 4);
-    assert_eq!(ack.accepted_signatures, 3);
-    assert_eq!(ack.latest_seq, 7);
+    assert_eq!(ack.accepted_signatures, 1);
+    assert_eq!(ack.latest_seq, 5);
 
     // 3. Node B (a completely fresh server) pulls incremental binary deltas from CustosHub via gRPC `pull_deltas`
     let dir_b = tempdir().unwrap();
@@ -234,22 +239,24 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
         Arc::new(SlidingWindowEngine::new(WindowConfig::default())),
         Arc::new(JevBatchAnalyzer::new(JevConfig::default(), true).unwrap()),
         fw_b.clone(),
-    );
+    )
+    .unwrap();
 
-    let delta_batch = hub_grpc
-        .pull_deltas(tonic::Request::new(PullRequest {
-            node_id: "node-b".to_string(),
-            since_seq: 0,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
+    let mut pull = tonic::Request::new(PullRequest {
+        node_id: "node-b".into(),
+        since_seq: 0,
+    });
+    pull.metadata_mut()
+        .insert("authorization", "Bearer test-hub-token".parse().unwrap());
+    pull.metadata_mut()
+        .insert("x-custos-node", "node-b".parse().unwrap());
+    let delta_batch = hub_grpc.pull_deltas(pull).await.unwrap().into_inner();
     let (ips_applied, sigs_applied) =
         apply_hub_delta_to_pipeline(&pipeline_b, &delta_batch).unwrap();
 
-    assert_eq!(delta_batch.latest_seq, 7);
+    assert_eq!(delta_batch.latest_seq, 5);
     assert_eq!(ips_applied, 4);
-    assert_eq!(sigs_applied, 3);
+    assert_eq!(sigs_applied, 1);
 
     // Verify Node B applied all 4 IPs in a SINGLE batched `pfctl` command (count == 1)!
     let cmds_b = fw_b.recent_commands();
@@ -287,7 +294,11 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
         .oneshot(
             Request::builder()
                 .uri("/hello")
-                .header("x-real-ip", "203.0.113.252")
+                .extension(axum::extract::ConnectInfo(
+                    "203.0.113.252:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -299,7 +310,9 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
         .oneshot(
             Request::builder()
                 .uri("/hello")
-                .header("x-real-ip", "192.0.2.55")
+                .extension(axum::extract::ConnectInfo(
+                    "192.0.2.55:12345".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )

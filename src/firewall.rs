@@ -1,11 +1,12 @@
 use crate::config::FirewallConfig;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use std::process::Command;
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, info, warn};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{debug, info};
 
 /// Cross-platform OS firewall backends supported by JevSec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,8 +74,68 @@ impl FirewallCommandSpec {
         }
     }
 
+    /// Shell-safe diagnostic/preview representation; execution always uses argv directly.
     pub fn to_shell_string(&self) -> String {
-        format!("{} {}", self.program, self.args.join(" "))
+        fn quote(arg: &str) -> String {
+            if !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "_@%+=:,./-".contains(ch))
+            {
+                arg.to_string()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        }
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .map(quote)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Execution boundary used by the firewall translator. Test runners never invoke
+/// a real OS firewall; production runners must honor the supplied deadline.
+pub trait FirewallCommandRunner: Send + Sync {
+    fn run(&self, command: &FirewallCommandSpec, timeout: Duration) -> Result<i32>;
+}
+
+#[derive(Default)]
+pub struct ProcessFirewallCommandRunner;
+
+impl FirewallCommandRunner for ProcessFirewallCommandRunner {
+    fn run(&self, command: &FirewallCommandSpec, timeout: Duration) -> Result<i32> {
+        let mut child = Command::new(&command.program)
+            .args(&command.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("Failed to spawn firewall binary `{}`", command.program))?;
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status.code().unwrap_or(-1)),
+                Ok(None) if start.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "Firewall command timed out after {} ms: {}",
+                        timeout.as_millis(),
+                        command.to_shell_string()
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("Failed to wait for firewall command");
+                }
+            }
+        }
     }
 }
 
@@ -91,16 +152,34 @@ pub struct FirewallBouncer {
     cfg: FirewallConfig,
     resolved_backend: FirewallBackend,
     recent_commands: Mutex<Vec<String>>,
+    runner: Arc<dyn FirewallCommandRunner>,
+    command_timeout: Duration,
+    initialization_lock: Mutex<()>,
     pub metrics: FirewallMetrics,
 }
 
 impl FirewallBouncer {
     pub fn new(cfg: FirewallConfig) -> Self {
+        Self::with_runner(
+            cfg,
+            Arc::new(ProcessFirewallCommandRunner),
+            Duration::from_secs(5),
+        )
+    }
+
+    pub fn with_runner(
+        cfg: FirewallConfig,
+        runner: Arc<dyn FirewallCommandRunner>,
+        command_timeout: Duration,
+    ) -> Self {
         let resolved_backend = cfg.backend.resolve();
         Self {
             cfg,
             resolved_backend,
             recent_commands: Mutex::new(Vec::new()),
+            runner,
+            command_timeout,
+            initialization_lock: Mutex::new(()),
             metrics: FirewallMetrics::default(),
         }
     }
@@ -129,40 +208,101 @@ impl FirewallBouncer {
         if !self.cfg.enabled {
             return Ok(Vec::new());
         }
-        let specs = self.build_init_commands();
-        self.execute_specs(&specs)
-    }
-
-    /// Blocks `ip` at the OS firewall level for `ttl_secs`.
-    pub fn ban_ip(&self, ip: IpAddr, ttl_secs: u64) -> Result<String> {
-        if !self.cfg.enabled {
-            return Ok(String::new());
+        if self.cfg.table_name.is_empty()
+            || !self
+                .cfg
+                .table_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            bail!("Firewall table name must contain only ASCII letters, digits, and underscores");
         }
-        let spec = self.build_ban_command(ip, ttl_secs);
-        self.execute_specs(std::slice::from_ref(&spec))?;
-        self.metrics.rules_applied.fetch_add(1, Ordering::Relaxed);
-        Ok(spec.to_shell_string())
+        let _guard = self
+            .initialization_lock
+            .lock()
+            .map_err(|_| anyhow!("Firewall initialization lock poisoned"))?;
+        let specs = self.build_init_commands();
+        if self.resolved_backend == FirewallBackend::Nftables {
+            let transaction = specs
+                .iter()
+                .map(|spec| spec.args.join(" "))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return self.execute_specs(&[FirewallCommandSpec::new("nft", [transaction])]);
+        }
+        let mut executed = Vec::new();
+        for spec in specs {
+            if self.resolved_backend == FirewallBackend::Ipset
+                && matches!(spec.program.as_str(), "iptables" | "ip6tables")
+                && !self.cfg.dry_run
+            {
+                let mut check = spec.clone();
+                if let Some(index) = check.args.iter().position(|arg| arg == "-I") {
+                    check.args[index] = "-C".into();
+                }
+                // Exit 1 means the rule is absent; other failures are operational errors.
+                match self.run_command(&check)? {
+                    0 => continue,
+                    1 => {}
+                    code => return self.command_failed(&check, code),
+                }
+            }
+            executed.extend(self.execute_specs(&[spec])?);
+        }
+        Ok(executed)
     }
 
-    /// Blocks a slice of `(IpAddr, ttl_secs)` entries in a single batched OS firewall
-    /// command where supported (`pfctl` and `nftables`), eliminating per-IP process spawn overhead.
+    pub fn ban_ip(&self, ip: IpAddr, ttl_secs: u64) -> Result<String> {
+        Ok(self.ban_ips_batch(&[(ip, ttl_secs)])?.join("\n"))
+    }
+
+    /// Counters reflect successfully completed groups even when a later group fails.
     pub fn ban_ips_batch(&self, entries: &[(IpAddr, u64)]) -> Result<Vec<String>> {
         if !self.cfg.enabled || entries.is_empty() {
             return Ok(Vec::new());
         }
-        let specs = self.build_batch_ban_commands(entries);
-        let out = self.execute_specs(&specs)?;
-        self.metrics
-            .rules_applied
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
-        Ok(out)
+        let mut executed = Vec::new();
+        for group in self.batch_groups(entries) {
+            if self.resolved_backend == FirewallBackend::WindowsNetsh && !self.cfg.dry_run {
+                let remove = self.build_unban_command(group[0].0);
+                // Removal distinguishes a missing rule from permission/service errors.
+                self.execute_specs(&[remove])?;
+            }
+            let specs = self.build_ban_group(&group);
+            executed.extend(self.execute_specs(&specs)?);
+            self.metrics
+                .rules_applied
+                .fetch_add(group.len() as u64, Ordering::Relaxed);
+        }
+        Ok(executed)
     }
 
-    /// Pure function that packs multiple `(IpAddr, ttl_secs)` entries into minimal OS commands.
-    pub fn build_batch_ban_commands(&self, entries: &[(IpAddr, u64)]) -> Vec<FirewallCommandSpec> {
-        if entries.is_empty() {
-            return Vec::new();
+    fn batch_groups(&self, entries: &[(IpAddr, u64)]) -> Vec<Vec<(IpAddr, u64)>> {
+        match self.resolved_backend {
+            FirewallBackend::Nftables => {
+                let (v4, v6): (Vec<_>, Vec<_>) =
+                    entries.iter().copied().partition(|(ip, _)| ip.is_ipv4());
+                v4.chunks(128)
+                    .chain(v6.chunks(128))
+                    .map(|chunk| chunk.to_vec())
+                    .collect()
+            }
+            FirewallBackend::Pf | FirewallBackend::Auto => {
+                entries.chunks(128).map(|chunk| chunk.to_vec()).collect()
+            }
+            _ => entries.iter().map(|entry| vec![*entry]).collect(),
         }
+    }
+
+    /// Packs entries into bounded OS commands, keeping large feeds below argv limits.
+    pub fn build_batch_ban_commands(&self, entries: &[(IpAddr, u64)]) -> Vec<FirewallCommandSpec> {
+        self.batch_groups(entries)
+            .iter()
+            .flat_map(|group| self.build_ban_group(group))
+            .collect()
+    }
+
+    fn build_ban_group(&self, entries: &[(IpAddr, u64)]) -> Vec<FirewallCommandSpec> {
         let table = &self.cfg.table_name;
         match self.resolved_backend {
             FirewallBackend::Pf | FirewallBackend::Auto => {
@@ -191,18 +331,10 @@ impl FirewallBouncer {
                 }
                 let mut specs = Vec::new();
                 if !v4_elems.is_empty() {
-                    let set_expr = format!("{{ {} }}", v4_elems.join(", "));
-                    specs.push(FirewallCommandSpec::new(
-                        "nft",
-                        ["add", "element", "inet", table, "block_v4", &set_expr],
-                    ));
+                    specs.push(nft_refresh_command(table, "block_v4", &v4_elems));
                 }
                 if !v6_elems.is_empty() {
-                    let set_expr = format!("{{ {} }}", v6_elems.join(", "));
-                    specs.push(FirewallCommandSpec::new(
-                        "nft",
-                        ["add", "element", "inet", table, "block_v6", &set_expr],
-                    ));
+                    specs.push(nft_refresh_command(table, "block_v6", &v6_elems));
                 }
                 specs
             }
@@ -218,10 +350,22 @@ impl FirewallBouncer {
         if !self.cfg.enabled {
             return Ok(String::new());
         }
-        let spec = self.build_unban_command(ip);
-        self.execute_specs(std::slice::from_ref(&spec))?;
+        let mut specs = Vec::new();
+        if matches!(
+            self.resolved_backend,
+            FirewallBackend::Pf | FirewallBackend::Auto
+        ) {
+            // An empty add creates a missing table without changing its addresses.
+            // This makes cleanup retryable after PF state was reset or after reboot.
+            specs.push(FirewallCommandSpec::new(
+                "pfctl",
+                ["-t", &self.cfg.table_name, "-T", "add"],
+            ));
+        }
+        specs.push(self.build_unban_command(ip));
+        let executed = self.execute_specs(&specs)?;
         self.metrics.rules_removed.fetch_add(1, Ordering::Relaxed);
-        Ok(spec.to_shell_string())
+        Ok(executed.join("\n"))
     }
 
     /// Pure function that constructs the initialization commands for the resolved OS backend.
@@ -263,6 +407,7 @@ impl FirewallBouncer {
                         "{ type filter hook input priority -10; policy accept; }",
                     ],
                 ),
+                FirewallCommandSpec::new("nft", ["flush", "chain", "inet", table, "input"]),
                 FirewallCommandSpec::new(
                     "nft",
                     [
@@ -319,6 +464,38 @@ impl FirewallBouncer {
                         "-exist",
                     ],
                 ),
+                FirewallCommandSpec::new(
+                    "iptables",
+                    [
+                        "-w",
+                        "5",
+                        "-I",
+                        "INPUT",
+                        "-m",
+                        "set",
+                        "--match-set",
+                        &format!("{table}_v4"),
+                        "src",
+                        "-j",
+                        "DROP",
+                    ],
+                ),
+                FirewallCommandSpec::new(
+                    "ip6tables",
+                    [
+                        "-w",
+                        "5",
+                        "-I",
+                        "INPUT",
+                        "-m",
+                        "set",
+                        "--match-set",
+                        &format!("{table}_v6"),
+                        "src",
+                        "-j",
+                        "DROP",
+                    ],
+                ),
             ],
             FirewallBackend::Pf | FirewallBackend::Auto => {
                 // pf tables are created on demand when adding the first IP via `pfctl -t <table> -T add`
@@ -335,8 +512,7 @@ impl FirewallBouncer {
         match self.resolved_backend {
             FirewallBackend::Nftables => {
                 let set_name = if ip.is_ipv4() { "block_v4" } else { "block_v6" };
-                let elem = format!("{{ {} timeout {}s }}", ip, ttl);
-                FirewallCommandSpec::new("nft", ["add", "element", "inet", table, set_name, &elem])
+                nft_refresh_command(table, set_name, &[format!("{ip} timeout {ttl}s")])
             }
             FirewallBackend::Ipset => {
                 let set_name = if ip.is_ipv4() {
@@ -385,10 +561,12 @@ impl FirewallBouncer {
         match self.resolved_backend {
             FirewallBackend::Nftables => {
                 let set_name = if ip.is_ipv4() { "block_v4" } else { "block_v6" };
-                let elem = format!("{{ {} }}", ip);
+                // Add+delete in one transaction also succeeds after native TTL expiry.
                 FirewallCommandSpec::new(
                     "nft",
-                    ["delete", "element", "inet", table, set_name, &elem],
+                    [format!(
+                        "add element inet {table} {set_name} {{ {ip} timeout 1s }}; delete element inet {table} {set_name} {{ {ip} }}"
+                    )],
                 )
             }
             FirewallBackend::Ipset => {
@@ -403,10 +581,15 @@ impl FirewallBouncer {
                 FirewallCommandSpec::new("pfctl", ["-t", table, "-T", "delete", &ip.to_string()])
             }
             FirewallBackend::WindowsNetsh => {
-                let rule_name = format!("name=Custos-Block-{}", ip);
+                // netsh uses the same nonzero status for a missing rule and
+                // operational errors. NetSecurity exposes a stable error ID so
+                // only an already-absent owned rule is treated as successful.
+                let script = format!(
+                    "$ErrorActionPreference = 'Stop'; try {{ Get-NetFirewallRule -DisplayName 'Custos-Block-{ip}' -ErrorAction Stop | Remove-NetFirewallRule -ErrorAction Stop; exit 0 }} catch {{ if ($_.FullyQualifiedErrorId -match '^CmdletizationQuery_NotFound(?:_[^,]+)?,Get-NetFirewallRule$') {{ exit 0 }}; Write-Error $_ -ErrorAction Continue; exit 1 }}"
+                );
                 FirewallCommandSpec::new(
-                    "netsh",
-                    ["advfirewall", "firewall", "delete", "rule", &rule_name],
+                    "powershell.exe",
+                    ["-NoProfile", "-NonInteractive", "-Command", &script],
                 )
             }
         }
@@ -414,66 +597,37 @@ impl FirewallBouncer {
 
     fn execute_specs(&self, specs: &[FirewallCommandSpec]) -> Result<Vec<String>> {
         let mut executed = Vec::with_capacity(specs.len());
-
         for spec in specs {
-            let cmd_str = spec.to_shell_string();
-            self.record_command(&cmd_str);
-
-            if self.cfg.dry_run {
-                info!(
-                    backend = self.resolved_backend.as_str(),
-                    dry_run = true,
-                    command = %cmd_str,
-                    "Simulated OS firewall rule"
-                );
-                executed.push(cmd_str);
-                continue;
+            let code = self.run_command(spec)?;
+            if code != 0 {
+                return self.command_failed(spec, code);
             }
-
-            debug!(
-                backend = self.resolved_backend.as_str(),
-                command = %cmd_str,
-                "Executing live OS firewall command"
-            );
-
-            let output = Command::new(&spec.program)
-                .args(&spec.args)
-                .output()
-                .with_context(|| format!("Failed to spawn firewall binary `{}`", spec.program));
-
-            match output {
-                Ok(out) if out.status.success() => {
-                    info!(
-                        backend = self.resolved_backend.as_str(),
-                        command = %cmd_str,
-                        "Enforced live OS firewall rule"
-                    );
-                    executed.push(cmd_str);
-                }
-                Ok(out) => {
-                    self.metrics.command_errors.fetch_add(1, Ordering::Relaxed);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(
-                        backend = self.resolved_backend.as_str(),
-                        command = %cmd_str,
-                        status = %out.status,
-                        stderr = %stderr.trim(),
-                        "OS firewall command returned non-zero status (ensure custos runs with root/Administrator privileges or set firewall.dry_run = true)"
-                    );
-                }
-                Err(err) => {
-                    self.metrics.command_errors.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        backend = self.resolved_backend.as_str(),
-                        command = %cmd_str,
-                        error = %err,
-                        "Failed to invoke OS firewall command"
-                    );
-                }
-            }
+            executed.push(spec.to_shell_string());
         }
-
         Ok(executed)
+    }
+
+    fn run_command(&self, spec: &FirewallCommandSpec) -> Result<i32> {
+        let command = spec.to_shell_string();
+        self.record_command(&command);
+        if self.cfg.dry_run {
+            info!(%command, "Simulated OS firewall rule");
+            return Ok(0);
+        }
+        debug!(%command, "Executing live OS firewall command");
+        self.runner
+            .run(spec, self.command_timeout)
+            .inspect_err(|_| {
+                self.metrics.command_errors.fetch_add(1, Ordering::Relaxed);
+            })
+    }
+
+    fn command_failed<T>(&self, spec: &FirewallCommandSpec, code: i32) -> Result<T> {
+        self.metrics.command_errors.fetch_add(1, Ordering::Relaxed);
+        bail!(
+            "Firewall command exited with status {code}: {}",
+            spec.to_shell_string()
+        )
     }
 
     fn record_command(&self, cmd: &str) {
@@ -484,6 +638,23 @@ impl FirewallBouncer {
             guard.push(cmd.to_string());
         }
     }
+}
+
+// `add` is idempotent, but older kernels do not refresh an existing timeout.
+// Add/delete/add in one nft transaction refreshes the lease without a packet gap.
+fn nft_refresh_command(table: &str, set: &str, elements: &[String]) -> FirewallCommandSpec {
+    let with_timeouts = elements.join(", ");
+    let addresses = elements
+        .iter()
+        .filter_map(|element| element.split_whitespace().next())
+        .collect::<Vec<_>>()
+        .join(", ");
+    FirewallCommandSpec::new(
+        "nft",
+        [format!(
+            "add element inet {table} {set} {{ {with_timeouts} }}; delete element inet {table} {set} {{ {addresses} }}; add element inet {table} {set} {{ {with_timeouts} }}"
+        )],
+    )
 }
 
 #[cfg(test)]
@@ -508,19 +679,19 @@ mod tests {
         let ban4 = fw.build_ban_command(ip4, 3600);
         assert_eq!(
             ban4.to_shell_string(),
-            "nft add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s }"
+            "nft 'add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s }; delete element inet custos_block block_v4 { 198.51.100.44 }; add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s }'"
         );
 
         let ban6 = fw.build_ban_command(ip6, 1800);
         assert_eq!(
             ban6.to_shell_string(),
-            "nft add element inet custos_block block_v6 { 2001:db8::dead:beef timeout 1800s }"
+            "nft 'add element inet custos_block block_v6 { 2001:db8::dead:beef timeout 1800s }; delete element inet custos_block block_v6 { 2001:db8::dead:beef }; add element inet custos_block block_v6 { 2001:db8::dead:beef timeout 1800s }'"
         );
 
         let unban4 = fw.build_unban_command(ip4);
         assert_eq!(
             unban4.to_shell_string(),
-            "nft delete element inet custos_block block_v4 { 198.51.100.44 }"
+            "nft 'add element inet custos_block block_v4 { 198.51.100.44 timeout 1s }; delete element inet custos_block block_v4 { 198.51.100.44 }'"
         );
     }
 
@@ -556,9 +727,21 @@ mod tests {
             fw_win.build_ban_command(ip, 600).to_shell_string(),
             "netsh advfirewall firewall add rule name=Custos-Block-198.51.100.99 dir=in action=block remoteip=198.51.100.99"
         );
-        assert_eq!(
-            fw_win.build_unban_command(ip).to_shell_string(),
-            "netsh advfirewall firewall delete rule name=Custos-Block-198.51.100.99"
+        let unban = fw_win.build_unban_command(ip);
+        assert_eq!(unban.program, "powershell.exe");
+        assert!(
+            unban
+                .args
+                .last()
+                .unwrap()
+                .contains("Custos-Block-198.51.100.99")
+        );
+        assert!(
+            unban
+                .args
+                .last()
+                .unwrap()
+                .contains("CmdletizationQuery_NotFound")
         );
     }
 
@@ -582,7 +765,7 @@ mod tests {
         assert_eq!(nft_cmds.len(), 1);
         assert_eq!(
             nft_cmds[0].to_shell_string(),
-            "nft add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s, 203.0.113.88 timeout 3600s }"
+            "nft 'add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s, 203.0.113.88 timeout 3600s }; delete element inet custos_block block_v4 { 198.51.100.44, 203.0.113.88 }; add element inet custos_block block_v4 { 198.51.100.44 timeout 3600s, 203.0.113.88 timeout 3600s }'"
         );
     }
 }
