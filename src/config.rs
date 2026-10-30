@@ -271,6 +271,9 @@ impl AppConfig {
         } else if Path::new("config.toml").exists() {
             let raw = std::fs::read_to_string("config.toml")?;
             toml::from_str::<AppConfig>(&raw)?
+        } else if Path::new("/etc/custos/config.toml").exists() {
+            let raw = std::fs::read_to_string("/etc/custos/config.toml")?;
+            toml::from_str::<AppConfig>(&raw)?
         } else {
             AppConfig::default()
         };
@@ -291,5 +294,37 @@ impl AppConfig {
             }
         }
         Ok(cfg)
+    }
+
+    /// Auto-discovers standard web-server access logs present on the host system
+    /// (Nginx, Caddy, Apache/HTTPD across Linux, macOS Homebrew, BSD, and Windows).
+    pub fn discover_system_logs() -> Vec<LogSourceConfig> {
+        let candidates: &[(&str, LogFormat)] = &[
+            ("/var/log/nginx/access.log", LogFormat::NginxCombined),
+            (
+                "/opt/homebrew/var/log/nginx/access.log",
+                LogFormat::NginxCombined,
+            ),
+            (
+                "/usr/local/var/log/nginx/access.log",
+                LogFormat::NginxCombined,
+            ),
+            ("/var/log/caddy/access.log", LogFormat::Json),
+            ("/var/log/apache2/access.log", LogFormat::NginxCombined),
+            ("/var/log/httpd/access_log", LogFormat::NginxCombined),
+            ("C:\\nginx\\logs\\access.log", LogFormat::NginxCombined),
+        ];
+
+        let mut found = Vec::new();
+        for (path_str, format) in candidates {
+            let p = Path::new(path_str);
+            if p.exists() {
+                found.push(LogSourceConfig {
+                    path: p.to_path_buf(),
+                    format: *format,
+                });
+            }
+        }
+        found
     }
 }

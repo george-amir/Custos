@@ -85,19 +85,34 @@ flowchart LR
 
 ## 🚀 Quick Start
 
-### 1. Install `custos`
-
-#### From Source (Cargo)
-> **Note:** `custos` vendors pre-generated Protobuf/gRPC bindings (`src/hub_proto.rs`), so **no external `protoc` compiler is required**.
+### 1. One-Line Install (Linux & macOS)
 
 ```bash
-git clone https://github.com/george-amir/Custos.git
-cd Custos
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/george-amir/Custos/main/install.sh | sh
 ```
 
-#### Verify Installation with Log Replay
-Test the full pipeline offline (`--mock-jev`) or against the live TypeSafe Jev API:
+#### Or Install Directly via Cargo (No `protoc` Required)
+```bash
+cargo install --git https://github.com/george-amir/Custos.git
+```
+
+### 2. Zero-Config Setup & Run (`custos init`)
+
+`custos init` automatically detects your operating system's native kernel firewall (`pf`, `nftables`, `ipset`, or `windows_netsh`), scans standard web-server paths for existing Nginx/Caddy/Apache access logs, and writes a ready-to-run `config.toml`:
+
+```bash
+# 1. Auto-detect OS firewall + web server logs and generate config.toml
+custos init
+
+# 2. Set your TypeSafe Jev API key (or omit to run in local simulation mode)
+export TYPESAFE_API_KEY="ts_live_..."
+
+# 3. Start the Custos daemon (or simply run `custos` with no arguments!)
+custos
+```
+
+### 3. Verify Installation with Log Replay
+Test the full pipeline on the included attack fixture:
 
 ```bash
 # Offline deterministic simulation (no API key required)
@@ -106,10 +121,8 @@ custos replay --log tests/fixtures/sample_access.log --mock-jev
 # Live TypeSafe Jev (/v1/systemone) evaluation
 export TYPESAFE_API_KEY="ts_live_..."
 custos replay --log tests/fixtures/sample_access.log
-```
 
-Preview the batched kernel firewall rules generated across all supported operating systems:
-```bash
+# Preview batched kernel firewall rules across Linux, macOS/BSD, and Windows
 custos firewall --backend all
 ```
 

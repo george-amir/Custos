@@ -38,12 +38,23 @@ struct Cli {
     config: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the custos daemon (tails configured log files, runs Jev batch analyzer, serves Bouncer HTTP API, OS Firewall, and gRPC Hub stream)
+    /// Auto-detect host OS firewall & web server logs and generate a ready-to-run config.toml
+    Init {
+        /// Output path for the generated configuration file
+        #[arg(short, long, default_value = "config.toml")]
+        output: PathBuf,
+
+        /// Configure live OS kernel firewall enforcement (dry_run = false)
+        #[arg(long, default_value_t = false)]
+        firewall_live: bool,
+    },
+
+    /// Run the custos daemon (tails configured or auto-discovered log files, runs Jev batch analyzer, serves Bouncer HTTP API, OS Firewall, and gRPC Hub stream)
     Run {
         /// Additional log file to tail (can be specified without a config file)
         #[arg(long)]
@@ -199,7 +210,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = AppConfig::load_or_default(cli.config.as_deref())?;
 
-    match cli.command {
+    let command = cli.command.unwrap_or(Commands::Run {
+        log: None,
+        from_start: false,
+        mock_jev: false,
+        firewall_backend: None,
+        firewall_live: false,
+        hub: None,
+        node_id: None,
+    });
+
+    match command {
+        Commands::Init {
+            output,
+            firewall_live,
+        } => cmd_init(&output, firewall_live),
         Commands::Run {
             log,
             from_start,
@@ -214,6 +239,16 @@ async fn main() -> Result<()> {
                     path: log_path,
                     format: LogFormat::NginxCombined,
                 });
+            }
+            if cfg.logs.is_empty() {
+                let discovered = AppConfig::discover_system_logs();
+                if !discovered.is_empty() {
+                    info!(
+                        count = discovered.len(),
+                        "Auto-discovered host web-server access logs"
+                    );
+                    cfg.logs.extend(discovered);
+                }
             }
             if let Some(b) = firewall_backend {
                 cfg.firewall.backend = parse_backend(&b);
@@ -287,6 +322,57 @@ async fn main() -> Result<()> {
         Commands::Check { ip, api_url } => cmd_check(ip, &api_url).await,
         Commands::Stats { api_url } => cmd_stats(&api_url).await,
     }
+}
+
+fn cmd_init(output: &std::path::Path, firewall_live: bool) -> Result<()> {
+    let mut cfg = AppConfig::default();
+    let resolved_fw = FirewallBackend::Auto.resolve();
+    cfg.firewall.backend = resolved_fw;
+    cfg.firewall.dry_run = !firewall_live;
+
+    let discovered_logs = AppConfig::discover_system_logs();
+    if discovered_logs.is_empty() {
+        cfg.logs.push(LogSourceConfig {
+            path: PathBuf::from("/var/log/nginx/access.log"),
+            format: LogFormat::NginxCombined,
+        });
+    } else {
+        cfg.logs = discovered_logs.clone();
+    }
+
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let serialized = toml::to_string_pretty(&cfg)?;
+    std::fs::write(output, serialized)
+        .with_context(|| format!("Failed to write config to {}", output.display()))?;
+
+    println!("=== Custos Zero-Config Initialization Complete ===");
+    println!("  Config Written       : {}", output.display());
+    println!(
+        "  Detected OS Firewall : {} (dry_run={})",
+        resolved_fw.as_str(),
+        cfg.firewall.dry_run
+    );
+    if discovered_logs.is_empty() {
+        println!(
+            "  Discovered Logs      : none found in standard paths (defaulted to /var/log/nginx/access.log)"
+        );
+    } else {
+        for l in &discovered_logs {
+            println!(
+                "  Discovered Log       : {} ({:?})",
+                l.path.display(),
+                l.format
+            );
+        }
+    }
+    println!("\nNext steps:");
+    println!("  1. Set your TypeSafe Jev key : export TYPESAFE_API_KEY=\"ts_live_...\"");
+    println!("  2. Start Custos daemon       : custos run");
+    Ok(())
 }
 
 fn parse_backend(s: &str) -> FirewallBackend {
