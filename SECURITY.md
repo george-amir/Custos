@@ -8,8 +8,8 @@ Only the latest minor release series receives security patches and advisories:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| `0.1.x` | :white_check_mark: |
-| `< 0.1` | :x:                |
+| `0.2.x` | :white_check_mark: |
+| `< 0.2` | :x:                |
 
 ---
 

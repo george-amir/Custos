@@ -5,6 +5,7 @@
 **Autonomous Behavioral Security Engine, Cross-Platform Kernel Firewall Bouncer & gRPC Threat-Intelligence Hub**  
 *Powered by [TypeSafe AI's Jev (`/v1/systemone`)](https://typesafe.ai) System-1 Decision Model*
 
+[![Release](https://img.shields.io/github/v/release/george-amir/Custos)](https://github.com/george-amir/Custos/releases/latest)
 [![CI](https://github.com/george-amir/Custos/actions/workflows/ci.yml/badge.svg)](https://github.com/george-amir/Custos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
@@ -30,10 +31,25 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 | **Hot-Path Request Latency** | Inline regex overhead | Out-of-band (Go/Python) | **0 ms** (Out-of-band log tailer) or **< 1 µs** (`DashMap` lookup) |
 | **Multi-Step Behavioral Detection** | ❌ Static single-line regex | ⚠️ Manual YAML scenarios | ✅ **Sliding IP behavioral windows + Jev `/v1/systemone` batching** |
 | **Prompt-Injection & Evasion Defense** | ❌ Vulnerable to encoding tricks | ❌ None | ✅ **Built-in adversarial log sanitizer + `noul` conviction scoring** |
-| **Zero-Day Auto-Signature Promotion** | ❌ Manual rule updates | ❌ Cloud-dependent | ✅ **Promotes high-confidence Jev verdicts into $0 L1 signatures** |
+| **Validated Exploit Signature Learning** | ❌ Manual rule updates | ❌ Cloud-dependent | ✅ **Caches exact known exploit targets from high-confidence verdicts** |
 | **OS Kernel Firewall Enforcement** | Linux-only `iptables` | Separate bouncer binaries | ✅ **Built-in batched `nftables`, `ipset`, macOS/BSD `pf`, Windows `netsh`** |
 | **Fleet-Wide Threat Sync** | ❌ Local-only | Polling REST APIs | ✅ **Real-time HTTP/2 gRPC streaming (`CustosHub`) with Canary & Quorum guards** |
 | **Build & Deployment Footprint** | Python + C dependencies | Multiple daemons + DB | ✅ **Single static Rust binary & zero-`protoc` embeddable crate** |
+
+---
+
+## v0.2.0: Security and Reliability Update
+
+[Download v0.2.0](https://github.com/george-amir/Custos/releases/tag/v0.2.0) for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), or Windows (x86_64).
+
+This release adds authenticated administrative and Hub operations, trusted proxy handling, conservative exploit-signature learning, and private credential files. Durable ban and unban records survive concurrent writes and restarts; failed firewall operations are reported and retried. Hub synchronization reconnects without extending expired bans or losing queued reports. Log ingestion handles rotation, partial records, and native Caddy JSON. Windows services, macOS service stopping, Docker enforcement, and Linux ARM64 release packaging are covered by regression or platform CI checks.
+
+### Upgrading from v0.1.x
+
+- **Administrative API:** configure the same `CUSTOS_API_TOKEN` (or `daemon.api_token`) in the daemon and CLI. An empty token disables POST/DELETE mutations with HTTP 503; read-only bouncer checks remain available.
+- **Hub deployments:** upgrade the Hub and every node together. All RPCs require credentials, and IP deltas include absolute expiry. Give each independent quorum voter a distinct entry in `hub.node_tokens`; a shared token counts as one identity.
+- **Embedded Rust applications:** `SecurityPipeline::new` returns `Result`, `AppState` takes `{ pipeline, api_token }`, and `DecisionStore::remove_ban` returns `Result<bool>`. Supply Axum `ConnectInfo<SocketAddr>` and configure only trusted proxy peers. Run periodic analysis and firewall reconciliation as shown in [the embedded example](examples/axum_embedded.rs).
+- **Source builds:** Rust 1.88 or newer is required. After installing, `custos --version` should report `custos 0.2.0`.
 
 ---
 
@@ -93,7 +109,7 @@ curl -fsSL https://raw.githubusercontent.com/george-amir/Custos/main/install.sh 
 
 #### Or Install Directly via Cargo (No `protoc` Required)
 ```bash
-cargo install --git https://github.com/george-amir/Custos.git
+cargo install --git https://github.com/george-amir/Custos.git --tag v0.2.0 --locked
 ```
 
 ### 2. Zero-Config Setup & Run (`custos init`)
@@ -379,7 +395,7 @@ Because `custos` vendors its generated Protobuf/gRPC code in [`src/hub_proto.rs`
 ### Add to `Cargo.toml`
 ```toml
 [dependencies]
-custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.1.0" }
+custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.2.0" }
 ```
 
 ### Embed `custos_bouncer_middleware` in an Axum Router
