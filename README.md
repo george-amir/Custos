@@ -42,9 +42,9 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 [Download v0.4.1](https://github.com/george-amir/Custos/releases/tag/v0.4.1). The JSON parser now recognizes Traefik's native field names, including `ClientHost` (or `ClientAddr`), `RequestMethod`, `RequestPath`, and `DownstreamStatus`. It preserves the request timestamp with nanosecond precision, using `StartUTC`, then `StartLocal`, then `time`. Client-facing status and bytes are used even when Traefik generates the response itself (`OriginStatus = 0`). Traefik's server-wide `RequestCount` never becomes a per-IP request count.
 
-Use `format = "json"` for Traefik, Caddy, or flat JSON access logs. Live `run --log` now accepts `--format json` (also `--log-format json`); omitting it preserves the Nginx combined default. Unknown format names are rejected instead of silently selecting another parser. See the [Dokploy configuration below](#traefik--dokploy-json-access-logs).
+Use `format = "json"` for Traefik, Caddy, or flat JSON access logs. Live `run --log` now accepts `--format json` (also `--log-format json`). Selecting an already-configured file updates that source rather than starting a second tailer, including equivalent existing paths. Without an explicit format, a matching source keeps its configured format; new sources default to Nginx combined. Unknown format names are rejected instead of silently selecting another parser. See the [Dokploy configuration below](#traefik--dokploy-json-access-logs).
 
-Validation: 153 Rust tests pass, including eight new Traefik regressions for client identity, IPv6, timestamps, proxy-generated responses, request counting, replay, and live ingestion. The original five pasted records parse in isolated mock replay and yield one scanner verdict. Docker validation also generates real Traefik JSON and replays it through the production image with networking and native firewall enforcement disabled.
+Validation: 154 Rust tests pass, including nine new Traefik regressions for client identity, IPv6, timestamps, proxy-generated responses, request counting, replay, live ingestion, and duplicate-source prevention. The original five pasted records parse in isolated mock replay and yield one scanner verdict. Docker validation also generates real Traefik JSON and replays it through the production image with networking and native firewall enforcement disabled.
 
 ## v0.4.0: False-positive safeguards and availability at saturation
 
@@ -486,7 +486,7 @@ Restart the existing Custos daemon after updating its binary and configuration. 
 # Use the [[logs]] entries from your configuration:
 sudo custos --config /etc/custos/config.toml run
 
-# Or supply an additional JSON log explicitly:
+# Or select the JSON log explicitly (updates an existing matching source):
 sudo custos run --log /etc/dokploy/traefik/dynamic/access.log --format json
 ```
 

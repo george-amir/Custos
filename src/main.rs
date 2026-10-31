@@ -55,7 +55,7 @@ enum Commands {
 
     /// Run the custos daemon (tails configured or auto-discovered log files, runs Jev batch analyzer, serves Bouncer HTTP API, OS Firewall, and gRPC Hub stream)
     Run {
-        /// Additional log file to tail (can be specified without a config file)
+        /// Log file to tail; updates a matching configured source without duplicating it
         #[arg(long)]
         log: Option<PathBuf>,
 
@@ -288,9 +288,20 @@ async fn async_main() -> Result<()> {
             node_id,
         } => {
             if let Some(log_path) = log {
+                let canonical = log_path.canonicalize().ok();
+                let matches = |source: &LogSourceConfig| {
+                    source.path == log_path
+                        || canonical.as_ref().is_some_and(|path| {
+                            source.path.canonicalize().ok().as_ref() == Some(path)
+                        })
+                };
+                let configured_format = cfg.logs.iter().find(|s| matches(s)).map(|s| s.format);
+                cfg.logs.retain(|s| !matches(s));
                 cfg.logs.push(LogSourceConfig {
                     path: log_path,
-                    format: format.unwrap_or(LogFormat::NginxCombined),
+                    format: format
+                        .or(configured_format)
+                        .unwrap_or(LogFormat::NginxCombined),
                 });
             }
             if cfg.logs.is_empty() {

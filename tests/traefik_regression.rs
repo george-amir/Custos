@@ -278,3 +278,101 @@ fn replay_cli_reads_native_traefik_json_and_rejects_unknown_formats() {
         }
     }
 }
+
+#[tokio::test]
+async fn selecting_an_already_configured_json_log_never_double_counts_requests() {
+    use custos::config::{AppConfig, LogSourceConfig};
+    use std::{
+        process::{Child, Command, Stdio},
+        time::Duration,
+    };
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("access.log");
+    let config = dir.path().join("config.toml");
+    let mut raw = record();
+    raw["RequestPath"] = "/api/feed".into();
+    raw["DownstreamStatus"] = 200.into();
+    raw["StartUTC"] = chrono::Utc::now().to_rfc3339().into();
+    std::fs::write(&log, (raw.to_string() + "\n").repeat(10)).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut cfg = AppConfig::default();
+    cfg.daemon.bouncer_listen = format!("127.0.0.1:{port}");
+    cfg.daemon.decisions_file = dir.path().join("ledger");
+    cfg.firewall.enabled = false;
+    cfg.window.l1_flood_threshold = 11;
+    cfg.logs = vec![LogSourceConfig {
+        path: dir.path().join(".").join("access.log"),
+        format: LogFormat::Json,
+    }];
+    custos::service::write_secret_file(&config, toml::to_string(&cfg).unwrap().as_bytes()).unwrap();
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_custos"))
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "run",
+                "--log",
+                log.to_str().unwrap(),
+                "--format",
+                "json",
+                "--from-start",
+                "--mock-jev",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            if let Ok(response) = client.get(format!("{url}/v1/stats")).send().await
+                && let Ok(stats) = response.json::<serde_json::Value>().await
+                && stats["events_processed"].as_u64().unwrap_or(0) >= 10
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stats: serde_json::Value = client
+        .get(format!("{url}/v1/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["events_processed"], 10,
+        "the CLI must update the configured source instead of adding a second tailer"
+    );
+    assert_eq!(
+        client
+            .get(format!("{url}/v1/bouncer/check?ip=198.51.100.44"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+}
