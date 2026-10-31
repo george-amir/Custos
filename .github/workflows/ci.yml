@@ -55,5 +55,7 @@ jobs:
         run: python3 .github/scripts/docker-capacity-smoke.py
       - name: Verify Nginx allows, throttles, bans, and forwards original methods
         run: python3 .github/scripts/docker-proxy-smoke.py
-      - name: Verify native Traefik JSON access logs
-        run: python3 .github/scripts/docker-traefik-smoke.py
+      - name: Verify native Traefik v3 and v2 JSON access logs
+        run: |
+          python3 .github/scripts/docker-traefik-smoke.py
+          CUSTOS_TRAEFIK_IMAGE=traefik:v2.10 python3 .github/scripts/docker-traefik-smoke.py
