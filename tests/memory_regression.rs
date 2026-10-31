@@ -148,7 +148,7 @@ fn hub_votes_signatures_and_history_expire_with_bounded_admission() {
         Arc::new(move || clock.load(Ordering::Relaxed)),
     );
     hub.ingest_batch(batch(1, "a"));
-    hub.ingest_batch(batch(2, "a"));
+    hub.ingest_batch(batch(2, "c"));
     let rejected = hub.ingest_batch(batch(3, "a"));
     assert_eq!(rejected.rejected_capacity, 2);
     assert_eq!(hub.retained_counts(), (2, 2, 0));
@@ -306,12 +306,22 @@ async fn retained_ban_capacity_blocks_new_http_admission_until_cleanup_completes
     cfg.firewall.enabled = false;
     cfg.daemon.decisions_file = dir.path().join("ledger");
     cfg.memory.max_decisions = 1;
+    cfg.daemon.on_decision_capacity = custos::config::DecisionCapacityPolicy::FailClosed;
     let p = SecurityPipeline::builder()
         .with_config(cfg)
         .with_mock_jev(true)
         .build()
         .unwrap();
-    ban(&p.store, 1).unwrap();
+    p.record_ban(
+        ip(1),
+        "test".into(),
+        DecisionSource::ManualAdmin,
+        1.,
+        1.,
+        "test".into(),
+        None,
+    )
+    .unwrap();
     assert!(p.reserve_event().is_err());
     let app = custos::bouncer_api::build_bouncer_router(custos::bouncer_api::AppState {
         pipeline: p.clone(),

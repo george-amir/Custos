@@ -1,6 +1,7 @@
 use crate::config::FirewallConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +65,8 @@ impl FirewallBackend {
 pub struct FirewallCommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
 }
 
 impl FirewallCommandSpec {
@@ -71,6 +74,7 @@ impl FirewallCommandSpec {
         Self {
             program: program.to_string(),
             args: args.into_iter().map(Into::into).collect(),
+            stdin: None,
         }
     }
 
@@ -108,15 +112,32 @@ impl FirewallCommandRunner for ProcessFirewallCommandRunner {
     fn run(&self, command: &FirewallCommandSpec, timeout: Duration) -> Result<i32> {
         let mut child = Command::new(&command.program)
             .args(&command.args)
-            .stdin(Stdio::null())
+            .stdin(if command.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("Failed to spawn firewall binary `{}`", command.program))?;
         let start = Instant::now();
+        // A writer cannot block the deadline loop if a command stops reading.
+        let writer = command.stdin.as_ref().map(|input| {
+            let mut stdin = child.stdin.take().expect("piped firewall stdin");
+            let input = input.clone();
+            std::thread::spawn(move || stdin.write_all(input.as_bytes()))
+        });
         loop {
             match child.try_wait() {
-                Ok(Some(status)) => return Ok(status.code().unwrap_or(-1)),
+                Ok(Some(status)) => {
+                    if let Some(writer) = writer {
+                        writer
+                            .join()
+                            .map_err(|_| anyhow!("Firewall input writer panicked"))??;
+                    }
+                    return Ok(status.code().unwrap_or(-1));
+                }
                 Ok(None) if start.elapsed() < timeout => {
                     std::thread::sleep(Duration::from_millis(5))
                 }
@@ -144,6 +165,14 @@ pub struct FirewallMetrics {
     pub rules_applied: AtomicU64,
     pub rules_removed: AtomicU64,
     pub command_errors: AtomicU64,
+}
+
+/// Only complete, successful groups are confirmed. A partially applied ipset
+/// restore is retried in full with idempotent deletes; its members stay durable.
+#[derive(Debug, Default)]
+pub struct UnbanBatchResult {
+    pub confirmed: Vec<IpAddr>,
+    pub errors: Vec<String>,
 }
 
 /// Cross-platform OS firewall bouncer that translates IP ban/unban decisions into
@@ -350,22 +379,113 @@ impl FirewallBouncer {
         if !self.cfg.enabled {
             return Ok(String::new());
         }
-        let mut specs = Vec::new();
-        if matches!(
-            self.resolved_backend,
-            FirewallBackend::Pf | FirewallBackend::Auto
-        ) {
-            // An empty add creates a missing table without changing its addresses.
-            // This makes cleanup retryable after PF state was reset or after reboot.
-            specs.push(FirewallCommandSpec::new(
-                "pfctl",
-                ["-t", &self.cfg.table_name, "-T", "add"],
-            ));
+        let result = self.unban_ips_batch(&[ip]);
+        anyhow::ensure!(result.errors.is_empty(), "{}", result.errors.join("; "));
+        Ok(self
+            .build_batch_unban_commands(&[ip])
+            .iter()
+            .map(FirewallCommandSpec::to_shell_string)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    pub fn cleanup_chunk_size(&self) -> usize {
+        if self.resolved_backend == FirewallBackend::WindowsNetsh {
+            1
+        } else {
+            128
         }
-        specs.push(self.build_unban_command(ip));
-        let executed = self.execute_specs(&specs)?;
-        self.metrics.rules_removed.fetch_add(1, Ordering::Relaxed);
-        Ok(executed.join("\n"))
+    }
+
+    /// Only PF/nftables currently batch adds. Bound lock ownership for backends
+    /// whose enforcement still needs a separate command for every address.
+    pub fn enforcement_chunk_size(&self) -> usize {
+        match self.resolved_backend {
+            FirewallBackend::Pf | FirewallBackend::Nftables | FirewallBackend::Auto => 128,
+            FirewallBackend::Ipset | FirewallBackend::WindowsNetsh => 1,
+        }
+    }
+
+    pub fn unban_ips_batch(&self, ips: &[IpAddr]) -> UnbanBatchResult {
+        let mut result = UnbanBatchResult::default();
+        if !self.cfg.enabled {
+            result.confirmed.extend_from_slice(ips);
+            return result;
+        }
+        for group in ips.chunks(self.cleanup_chunk_size()) {
+            let execution = if self.cfg.enabled {
+                self.execute_specs(&self.build_unban_group(group))
+            } else {
+                Ok(Vec::new())
+            };
+            match execution {
+                Ok(_) => {
+                    result.confirmed.extend_from_slice(group);
+                    self.metrics
+                        .rules_removed
+                        .fetch_add(group.len() as u64, Ordering::Relaxed);
+                }
+                Err(error) => result.errors.push(error.to_string()),
+            }
+        }
+        result
+    }
+
+    pub fn build_batch_unban_commands(&self, ips: &[IpAddr]) -> Vec<FirewallCommandSpec> {
+        ips.chunks(self.cleanup_chunk_size())
+            .flat_map(|group| self.build_unban_group(group))
+            .collect()
+    }
+
+    fn build_unban_group(&self, ips: &[IpAddr]) -> Vec<FirewallCommandSpec> {
+        let table = &self.cfg.table_name;
+        match self.resolved_backend {
+            FirewallBackend::Pf | FirewallBackend::Auto => {
+                let mut delete = FirewallCommandSpec::new("pfctl", ["-t", table, "-T", "delete"]);
+                delete.args.extend(ips.iter().map(ToString::to_string));
+                vec![
+                    FirewallCommandSpec::new("pfctl", ["-t", table, "-T", "add"]),
+                    delete,
+                ]
+            }
+            FirewallBackend::Nftables => {
+                let mut transactions = Vec::new();
+                for (v4, set) in [(true, "block_v4"), (false, "block_v6")] {
+                    let addresses: Vec<_> = ips
+                        .iter()
+                        .filter(|ip| ip.is_ipv4() == v4)
+                        .map(ToString::to_string)
+                        .collect();
+                    if addresses.is_empty() {
+                        continue;
+                    }
+                    let timed = addresses
+                        .iter()
+                        .map(|ip| format!("{ip} timeout 1s"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    transactions.push(format!("add element inet {table} {set} {{ {timed} }}; delete element inet {table} {set} {{ {} }}", addresses.join(", ")));
+                }
+                vec![FirewallCommandSpec::new("nft", [transactions.join("; ")])]
+            }
+            FirewallBackend::Ipset => {
+                let mut command = FirewallCommandSpec::new("ipset", ["restore", "-exist"]);
+                command.stdin = Some(
+                    ips.iter()
+                        .map(|ip| {
+                            format!(
+                                "del {table}_{} {ip}\n",
+                                if ip.is_ipv4() { "v4" } else { "v6" }
+                            )
+                        })
+                        .collect(),
+                );
+                vec![command]
+            }
+            FirewallBackend::WindowsNetsh => {
+                ips.iter().map(|ip| self.build_unban_command(*ip)).collect()
+            }
+        }
     }
 
     /// Pure function that constructs the initialization commands for the resolved OS backend.

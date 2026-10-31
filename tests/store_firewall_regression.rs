@@ -461,3 +461,151 @@ fn large_firewall_feeds_use_bounded_commands_in_builders_and_execution() {
         assert_eq!(fw.metrics.rules_applied.load(Ordering::Relaxed), 50_000);
     }
 }
+
+#[test]
+fn mass_unbans_use_bounded_native_batches_and_confirm_all_successful_members() {
+    let ips: Vec<_> = (0..5000u16)
+        .map(|n| {
+            IpAddr::V6(std::net::Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, n,
+            ))
+        })
+        .collect();
+    for backend in [
+        FirewallBackend::Pf,
+        FirewallBackend::Nftables,
+        FirewallBackend::Ipset,
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner_calls = calls.clone();
+        let fw = FirewallBouncer::with_runner(
+            live_config(backend),
+            Arc::new(Runner(move |cmd: &FirewallCommandSpec, _: Duration| {
+                runner_calls.fetch_add(1, Ordering::Relaxed);
+                assert!(cmd.args.iter().map(|arg| arg.len() + 1).sum::<usize>() < 32768);
+                if let Some(input) = &cmd.stdin {
+                    assert!(input.len() < 16384);
+                    assert!(input.lines().count() <= 128);
+                }
+                Ok(0)
+            })),
+            Duration::from_millis(10),
+        );
+        let expected = 5000usize.div_ceil(128) * if backend == FirewallBackend::Pf { 2 } else { 1 };
+        assert_eq!(fw.build_batch_unban_commands(&ips).len(), expected);
+        let result = fw.unban_ips_batch(&ips);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.confirmed, ips);
+        assert_eq!(calls.load(Ordering::Relaxed), expected);
+        assert_eq!(fw.metrics.rules_removed.load(Ordering::Relaxed), 5000);
+    }
+}
+
+#[test]
+fn partially_applied_ipset_restore_is_unconfirmed_and_retry_is_idempotent() {
+    use std::collections::HashSet;
+    let ips: Vec<IpAddr> = (1..=128u8)
+        .map(|n| IpAddr::from([198, 51, 100, n]))
+        .collect();
+    let live = Arc::new(Mutex::new(ips.iter().copied().collect::<HashSet<_>>()));
+    let kernel = live.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    let fw = FirewallBouncer::with_runner(
+        live_config(FirewallBackend::Ipset),
+        Arc::new(Runner(move |cmd: &FirewallCommandSpec, _: Duration| {
+            assert_eq!(cmd.args, ["restore", "-exist"]);
+            let fail = count.fetch_add(1, Ordering::Relaxed) == 0;
+            for (idx, line) in cmd.stdin.as_ref().unwrap().lines().enumerate() {
+                if fail && idx == 32 {
+                    return Ok(2);
+                }
+                let words: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(&words[..2], ["del", "custos_block_v4"]);
+                kernel
+                    .lock()
+                    .unwrap()
+                    .remove(&words[2].parse::<IpAddr>().unwrap());
+            }
+            Ok(0)
+        })),
+        Duration::from_millis(10),
+    );
+    let failed = fw.unban_ips_batch(&ips);
+    assert!(failed.confirmed.is_empty());
+    assert_eq!(failed.errors.len(), 1);
+    assert_eq!(live.lock().unwrap().len(), 96);
+    assert_eq!(fw.metrics.rules_removed.load(Ordering::Relaxed), 0);
+    let retried = fw.unban_ips_batch(&ips);
+    assert!(retried.errors.is_empty());
+    assert_eq!(retried.confirmed, ips);
+    assert!(live.lock().unwrap().is_empty());
+}
+
+#[test]
+fn windows_cleanup_confirms_successful_addresses_without_acknowledging_later_failures() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let attempts = count.clone();
+    let fw = FirewallBouncer::with_runner(
+        live_config(FirewallBackend::WindowsNetsh),
+        Arc::new(Runner(move |_: &FirewallCommandSpec, _: Duration| {
+            Ok(if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                0
+            } else {
+                2
+            })
+        })),
+        Duration::from_millis(10),
+    );
+    let ips: Vec<_> = (1..=3).map(|n| IpAddr::from([198, 51, 100, n])).collect();
+    let result = fw.unban_ips_batch(&ips);
+    assert_eq!(result.confirmed, ips[..1]);
+    assert_eq!(result.errors.len(), 2);
+    assert_eq!(fw.metrics.rules_removed.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn batch_acknowledgment_deduplicates_cleanup_and_preserves_renewed_bans_durably() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger");
+    let store = DecisionStore::open_with_limit(path.clone(), 3600, 3).unwrap();
+    let ips: Vec<_> = (1..=3).map(|n| IpAddr::from([198, 51, 100, n])).collect();
+    for ip in &ips {
+        ban(&store, *ip);
+        store.remove_ban(ip).unwrap();
+    }
+    ban(&store, ips[0]);
+    assert_eq!(
+        store
+            .acknowledge_cleanup_batch(&[ips[0], ips[1], ips[1], ips[2]])
+            .unwrap(),
+        2
+    );
+    assert!(store.check_ip(&ips[0]).is_some());
+    assert_eq!(store.retained_count(), 1);
+    let reopened = DecisionStore::open_with_limit(path, 3600, 3).unwrap();
+    assert!(reopened.check_ip(&ips[0]).is_some());
+    assert!(reopened.sweep_expired().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn production_runner_deadline_also_covers_commands_that_never_read_stdin() {
+    let mut command = FirewallCommandSpec::new("/bin/sleep", ["5"]);
+    command.stdin = Some("x".repeat(512 * 1024));
+    let start = Instant::now();
+    assert!(
+        ProcessFirewallCommandRunner
+            .run(&command, Duration::from_millis(20))
+            .is_err()
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let mut consumes = FirewallCommandSpec::new("/usr/bin/wc", ["-c"]);
+    consumes.stdin = Some("x".repeat(128 * 1024));
+    assert_eq!(
+        ProcessFirewallCommandRunner
+            .run(&consumes, Duration::from_secs(2))
+            .unwrap(),
+        0
+    );
+}

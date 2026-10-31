@@ -13,6 +13,7 @@ use std::net::IpAddr;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// High-value sensitive or exploit-probe path substrings that immediately raise L1 suspicion.
 const SENSITIVE_PATH_PATTERNS: &[&str] = &[
@@ -66,6 +67,7 @@ pub enum L1Disposition {
 struct IpWindowState {
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
+    last_observed: Instant,
     total_requests: usize,
     unique_paths: HashSet<u64>,
     status_2xx: usize,
@@ -86,6 +88,7 @@ impl IpWindowState {
         Self {
             first_seen: now,
             last_seen: now,
+            last_observed: Instant::now(),
             total_requests: 0,
             unique_paths: HashSet::new(),
             status_2xx: 0,
@@ -196,6 +199,18 @@ impl SlidingWindowEngine {
         self.auto_signatures
             .retain(|_, (_, expires)| *expires > Utc::now());
         self.auto_signatures.len()
+    }
+
+    /// Read-only exact signature enforcement, usable before an HTTP handler and
+    /// without allocating a durable ban slot. Sensitive-path heuristics are not signatures.
+    pub fn cached_signature(&self, method: &str, path: &str) -> Option<String> {
+        if method.len() > MAX_METHOD_BYTES || path.len() > crate::limits::MAX_SIGNATURE_BYTES {
+            return None;
+        }
+        self.auto_signatures
+            .get(&(method.to_uppercase(), path.trim().to_string()))
+            .filter(|signature| signature.value().1 > Utc::now())
+            .map(|signature| signature.value().0.clone())
     }
 
     /// Ingests one `AccessLogEvent` into the L1 filter and per-IP sliding window.
@@ -325,6 +340,7 @@ impl SlidingWindowEngine {
         let win = entry.value_mut();
 
         win.last_seen = win.last_seen.max(ev.timestamp);
+        win.last_observed = Instant::now();
         let previous_score = win.suspicion_score;
         win.total_requests += 1;
         if win.unique_paths.len() < self.cfg.l1_flood_threshold.clamp(1, MAX_UNIQUE_PATHS) {
@@ -482,13 +498,23 @@ impl SlidingWindowEngine {
     /// or `force_all` is true), packing them into sanitized `ActorStateSummary` structs
     /// ready for a bulk Jev `/v1/systemone` request.
     pub fn drain_suspicious_summaries(&self, force_all: bool) -> Vec<ActorStateSummary> {
+        self.drain_suspicious_work(force_all)
+            .into_iter()
+            .map(|(summary, _)| summary)
+            .collect()
+    }
+
+    pub(crate) fn drain_suspicious_work(
+        &self,
+        force_all: bool,
+    ) -> Vec<(ActorStateSummary, Instant)> {
         let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         let mut to_remove = Vec::new();
         let mut summaries = Vec::new();
         let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         for (ip, win) in ready.drain(..) {
-            summaries.push(self.summary(ip, &win, summaries.len()));
+            summaries.push((self.summary(ip, &win, summaries.len()), win.last_observed));
         }
         drop(ready);
 
@@ -504,7 +530,7 @@ impl SlidingWindowEngine {
             {
                 to_remove.push(ip);
                 if win.suspicion_score >= self.cfg.min_suspicion_score {
-                    summaries.push(self.summary(ip, win, summaries.len()));
+                    summaries.push((self.summary(ip, win, summaries.len()), win.last_observed));
                 }
             }
         }
@@ -534,7 +560,7 @@ impl SlidingWindowEngine {
         ready.push_back((ip, old));
     }
 
-    fn max_windows(&self) -> usize {
+    pub fn max_windows(&self) -> usize {
         // Reserve heap overhead as well as the bounded sample and cardinality storage.
         let bytes = 2048
             + 4 * (MAX_SANITIZED_UA_LEN * 4 + 128)

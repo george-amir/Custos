@@ -161,6 +161,8 @@ struct HubState {
     sig_voters: HashMap<(String, String), Votes>,
     promoted_sigs: HashMap<(String, String), i64>,
     delta_log: Vec<DeltaEntry>,
+    node_ip_votes: HashMap<String, usize>,
+    node_sig_votes: HashMap<String, usize>,
 }
 
 impl HubState {
@@ -171,14 +173,37 @@ impl HubState {
         self.last_expire = now;
         self.promoted_ips.retain(|_, expiry| *expiry > now);
         self.promoted_sigs.retain(|_, expiry| *expiry > now);
-        self.ip_voters.retain(|_, votes| votes.expires > now);
-        self.sig_voters.retain(|_, votes| votes.expires > now);
+        self.ip_voters.retain(|_, votes| {
+            if votes.expires > now {
+                return true;
+            }
+            release_votes(&mut self.node_ip_votes, votes);
+            false
+        });
+        self.sig_voters.retain(|_, votes| {
+            if votes.expires > now {
+                return true;
+            }
+            release_votes(&mut self.node_sig_votes, votes);
+            false
+        });
         self.delta_log.retain(|entry| match entry {
             DeltaEntry::Ip(delta) => delta.expires_at_unix_secs > now,
             DeltaEntry::Signature(delta) => self
                 .promoted_sigs
                 .contains_key(&(delta.method.clone(), delta.path_prefix.clone())),
         });
+    }
+}
+
+fn release_votes(counts: &mut HashMap<String, usize>, votes: &Votes) {
+    for node in &votes.nodes {
+        if let Some(count) = counts.get_mut(node) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(node);
+            }
+        }
     }
 }
 
@@ -251,8 +276,30 @@ impl HubEngine {
             ack.latest_seq = state.latest_seq;
             return ack;
         }
-        let vote_expiry =
+        let signature_expiry =
             now.saturating_add(self.limits.hub_retention_secs.min(i64::MAX as u64) as i64);
+        let vote_expiry = now.saturating_add(
+            self.limits
+                .hub_vote_ttl_secs
+                .min(self.limits.hub_retention_secs)
+                .min(i64::MAX as u64) as i64,
+        );
+        let pending_ip_limit = self
+            .limits
+            .hub_max_pending_entries
+            .min(self.limits.hub_max_entries);
+        let pending_sig_limit = self
+            .limits
+            .hub_max_pending_signatures
+            .min(self.limits.max_signatures);
+        let node_ip_limit = self
+            .limits
+            .hub_max_pending_per_node
+            .min(pending_ip_limit.div_ceil(2).max(1));
+        let node_sig_limit = self
+            .limits
+            .hub_max_pending_per_node
+            .min(pending_sig_limit.div_ceil(2).max(1));
         let mut ip_deltas = Vec::new();
         let mut signature_deltas = Vec::new();
         for signal in batch.ip_signals {
@@ -267,8 +314,23 @@ impl HubEngine {
                 ack.accepted_ips += 1;
                 continue;
             }
-            if !state.ip_voters.contains_key(&ip)
-                && state.ip_voters.len() + state.promoted_ips.len() >= self.limits.hub_max_entries
+            let existing = state.ip_voters.get(&ip);
+            let new_vote = existing.is_none_or(|votes| !votes.nodes.contains(&batch.node_id));
+            let completes_quorum = existing
+                .map_or(1, |votes| votes.nodes.len() + usize::from(new_vote))
+                >= self.quorum_min_nodes;
+            if (!state.ip_voters.contains_key(&ip)
+                && (state.ip_voters.len() + state.promoted_ips.len()
+                    >= self.limits.hub_max_entries
+                    || (!completes_quorum && state.ip_voters.len() >= pending_ip_limit)))
+                || (new_vote
+                    && !completes_quorum
+                    && state
+                        .node_ip_votes
+                        .get(&batch.node_id)
+                        .copied()
+                        .unwrap_or(0)
+                        >= node_ip_limit)
             {
                 ack.rejected_capacity += 1;
                 continue;
@@ -281,9 +343,16 @@ impl HubEngine {
                 ack.rejected_capacity += 1;
                 continue;
             }
-            voters.nodes.insert(batch.node_id.clone());
+            let inserted = voters.nodes.insert(batch.node_id.clone());
+            let promoted = voters.nodes.len() >= self.quorum_min_nodes;
+            if inserted {
+                *state
+                    .node_ip_votes
+                    .entry(batch.node_id.clone())
+                    .or_default() += 1;
+            }
             ack.accepted_ips += 1;
-            if voters.nodes.len() >= self.quorum_min_nodes {
+            if promoted {
                 state.latest_seq += 1;
                 let ttl_secs = signal.suggested_ttl_secs.clamp(1, 86400);
                 let expires_at_unix_secs = now.saturating_add(i64::from(ttl_secs));
@@ -296,7 +365,9 @@ impl HubEngine {
                     ttl_secs,
                     expires_at_unix_secs,
                 };
-                state.ip_voters.remove(&ip);
+                if let Some(votes) = state.ip_voters.remove(&ip) {
+                    release_votes(&mut state.node_ip_votes, &votes);
+                }
                 state.promoted_ips.insert(ip, expires_at_unix_secs);
                 state.delta_log.push(DeltaEntry::Ip(delta.clone()));
                 ip_deltas.push(delta);
@@ -315,8 +386,23 @@ impl HubEngine {
                 ack.accepted_signatures += 1;
                 continue;
             }
-            if !state.sig_voters.contains_key(&key)
-                && state.sig_voters.len() + state.promoted_sigs.len() >= self.limits.max_signatures
+            let existing = state.sig_voters.get(&key);
+            let new_vote = existing.is_none_or(|votes| !votes.nodes.contains(&batch.node_id));
+            let completes_quorum = existing
+                .map_or(1, |votes| votes.nodes.len() + usize::from(new_vote))
+                >= self.quorum_min_nodes;
+            if (!state.sig_voters.contains_key(&key)
+                && (state.sig_voters.len() + state.promoted_sigs.len()
+                    >= self.limits.max_signatures
+                    || (!completes_quorum && state.sig_voters.len() >= pending_sig_limit)))
+                || (new_vote
+                    && !completes_quorum
+                    && state
+                        .node_sig_votes
+                        .get(&batch.node_id)
+                        .copied()
+                        .unwrap_or(0)
+                        >= node_sig_limit)
             {
                 ack.rejected_capacity += 1;
                 continue;
@@ -332,9 +418,16 @@ impl HubEngine {
                 ack.rejected_capacity += 1;
                 continue;
             }
-            voters.nodes.insert(batch.node_id.clone());
+            let inserted = voters.nodes.insert(batch.node_id.clone());
+            let promoted = voters.nodes.len() >= self.quorum_min_nodes;
+            if inserted {
+                *state
+                    .node_sig_votes
+                    .entry(batch.node_id.clone())
+                    .or_default() += 1;
+            }
             ack.accepted_signatures += 1;
-            if voters.nodes.len() >= self.quorum_min_nodes {
+            if promoted {
                 state.latest_seq += 1;
                 let delta = SignatureDelta {
                     seq: state.latest_seq,
@@ -342,8 +435,10 @@ impl HubEngine {
                     path_prefix: key.1.clone(),
                     threat: signal.threat,
                 };
-                state.sig_voters.remove(&key);
-                state.promoted_sigs.insert(key, vote_expiry);
+                if let Some(votes) = state.sig_voters.remove(&key) {
+                    release_votes(&mut state.node_sig_votes, &votes);
+                }
+                state.promoted_sigs.insert(key, signature_expiry);
                 state.delta_log.push(DeltaEntry::Signature(delta.clone()));
                 signature_deltas.push(delta);
             }
@@ -370,6 +465,18 @@ impl HubEngine {
             state.ip_voters.len() + state.promoted_ips.len(),
             state.sig_voters.len() + state.promoted_sigs.len(),
             state.delta_log.len(),
+        )
+    }
+
+    /// Candidate IPs/signatures and their authenticated reporter accounting.
+    pub fn pending_counts(&self) -> (usize, usize, usize, usize) {
+        let mut state = self.state.lock().expect("Hub state lock poisoned");
+        state.expire((self.clock)());
+        (
+            state.ip_voters.len(),
+            state.sig_voters.len(),
+            state.node_ip_votes.len(),
+            state.node_sig_votes.len(),
         )
     }
 
@@ -750,7 +857,7 @@ pub fn apply_hub_delta_to_pipeline(
         }
         let ttl = remaining as u64;
 
-        pipeline.store.upsert_ban(
+        pipeline.store.upsert_ban_with_kernel(
             ip,
             threat_str,
             DecisionSource::HubCommunity,
@@ -758,6 +865,7 @@ pub fn apply_hub_delta_to_pipeline(
             ip_delta.confidence as f64,
             format!("Synced from CustosHub (seq={})", ip_delta.seq),
             Some(ttl),
+            pipeline.firewall.is_enabled() && !pipeline.firewall.is_dry_run(),
         )?;
         new_fw_entries.push((ip, ttl));
         applied_ips += 1;
@@ -780,6 +888,11 @@ pub fn apply_hub_delta_to_pipeline(
 
     // Apply all newly learned Hub IPs in a single batched OS firewall invocation
     if !new_fw_entries.is_empty() {
+        if pipeline.firewall.is_enabled() && !pipeline.firewall.is_dry_run() {
+            pipeline.store.require_kernel_cleanup(
+                &new_fw_entries.iter().map(|(ip, _)| *ip).collect::<Vec<_>>(),
+            )?;
+        }
         pipeline.firewall.ban_ips_batch(&new_fw_entries)?;
     }
 

@@ -48,6 +48,8 @@ async fn require_admin(
 #[derive(Debug, Deserialize)]
 pub struct CheckQuery {
     pub ip: Option<String>,
+    pub method: Option<String>,
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +162,7 @@ async fn handle_bouncer_check(
 ) -> impl IntoResponse {
     let raw_ip = query
         .ip
+        .clone()
         .or_else(|| {
             headers
                 .get("x-real-ip")
@@ -219,7 +222,27 @@ async fn handle_bouncer_check(
                 noul_probability: Some(decision.noul_probability),
             }),
         )
-    } else if state.store.is_at_capacity() {
+    } else if let Some(threat) = original_request_signature(&state, &query, &headers) {
+        let (status, action, reason) = match threat {
+            Ok(threat) => (StatusCode::FORBIDDEN, "block", threat),
+            Err(()) => (
+                StatusCode::BAD_REQUEST,
+                "error_invalid_request",
+                "Invalid original method/URI metadata".into(),
+            ),
+        };
+        (
+            status,
+            HeaderMap::new(),
+            Json(BouncerCheckResponse {
+                ip: ip.to_string(),
+                action: action.into(),
+                threat_class: (status == StatusCode::FORBIDDEN).then_some(reason.clone()),
+                reason: Some(reason),
+                noul_probability: None,
+            }),
+        )
+    } else if !state.capacity_allows_traffic() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             HeaderMap::new(),
@@ -243,6 +266,50 @@ async fn handle_bouncer_check(
                 noul_probability: None,
             }),
         )
+    }
+}
+
+// Only a trusted proxy should reach the standalone checker. It must overwrite
+// these headers with original request metadata, just as it supplies client IP.
+fn original_request_signature(
+    state: &AppState,
+    query: &CheckQuery,
+    headers: &HeaderMap,
+) -> Option<Result<String, ()>> {
+    let header = |name: &str| -> Result<Option<&str>, ()> {
+        if headers.get_all(name).iter().count() > 1 {
+            return Err(());
+        }
+        headers
+            .get(name)
+            .map(|value| value.to_str().map_err(|_| ()))
+            .transpose()
+    };
+    let metadata = (|| -> Result<Option<(String, axum::http::Uri)>, ()> {
+        let method = header("x-original-method")?.or(query.method.as_deref());
+        let uri = header("x-original-uri")?.or(query.uri.as_deref());
+        let (method, uri) = match (method, uri) {
+            (None, None) => return Ok(None),
+            (Some(method), Some(uri)) => (method, uri),
+            _ => return Err(()),
+        };
+        if method.len() > crate::tailer::MAX_METHOD_BYTES
+            || uri.len() > crate::tailer::MAX_URI_BYTES
+            || !uri.starts_with('/')
+        {
+            return Err(());
+        }
+        let method = method.parse::<axum::http::Method>().map_err(|_| ())?;
+        let uri = uri.parse::<axum::http::Uri>().map_err(|_| ())?;
+        if uri.scheme().is_some() || uri.authority().is_some() {
+            return Err(());
+        }
+        Ok(Some((method.to_string(), uri)))
+    })();
+    match metadata {
+        Err(()) => Some(Err(())),
+        Ok(Some((method, uri))) => state.window.cached_signature(&method, uri.path()).map(Ok),
+        Ok(None) => None,
     }
 }
 
@@ -397,6 +464,22 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
         .command_errors
         .load(Ordering::Relaxed);
 
+    let retained = state.store.retained_count();
+    let cleanup_pending = state.store.sweep_expired().len();
+    let saturated = usize::from(state.store.is_at_capacity());
+    let capacity_allowed = state.capacity_allowed.load(Ordering::Relaxed);
+    let capacity_blocked = state.capacity_blocked.load(Ordering::Relaxed);
+    let analysis_actors = state
+        .analysis_metrics
+        .pending_actors
+        .load(Ordering::Relaxed);
+    let analysis_bytes = state.analysis_metrics.pending_bytes.load(Ordering::Relaxed);
+    let analysis_expired = state.analysis_metrics.expired.load(Ordering::Relaxed);
+    let analysis_dropped = state
+        .analysis_metrics
+        .capacity_dropped
+        .load(Ordering::Relaxed);
+    let analysis_retried = state.analysis_metrics.retried.load(Ordering::Relaxed);
     let body = format!(
         "# HELP custos_events_processed_total Total HTTP access log events ingested.\n\
          # TYPE custos_events_processed_total counter\n\
@@ -448,7 +531,27 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
          custos_firewall_rules_removed_total {fw_removed}\n\
          # HELP custos_firewall_command_errors_total Total OS firewall execution errors.\n\
          # TYPE custos_firewall_command_errors_total counter\n\
-         custos_firewall_command_errors_total {fw_errors}\n"
+         custos_firewall_command_errors_total {fw_errors}\n\
+         # TYPE custos_decision_retained gauge\n\
+         custos_decision_retained {retained}\n\
+         # TYPE custos_decision_cleanup_pending gauge\n\
+         custos_decision_cleanup_pending {cleanup_pending}\n\
+         # TYPE custos_decision_saturated gauge\n\
+         custos_decision_saturated {saturated}\n\
+         # TYPE custos_decision_capacity_allowed_total counter\n\
+         custos_decision_capacity_allowed_total {capacity_allowed}\n\
+         # TYPE custos_decision_capacity_blocked_total counter\n\
+         custos_decision_capacity_blocked_total {capacity_blocked}\n\
+         # TYPE custos_analysis_pending_actors gauge\n\
+         custos_analysis_pending_actors {analysis_actors}\n\
+         # TYPE custos_analysis_pending_bytes gauge\n\
+         custos_analysis_pending_bytes {analysis_bytes}\n\
+         # TYPE custos_analysis_expired_total counter\n\
+         custos_analysis_expired_total {analysis_expired}\n\
+         # TYPE custos_analysis_capacity_dropped_total counter\n\
+         custos_analysis_capacity_dropped_total {analysis_dropped}\n\
+         # TYPE custos_analysis_retried_total counter\n\
+         custos_analysis_retried_total {analysis_retried}\n"
     );
 
     let mut headers = HeaderMap::new();

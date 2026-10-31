@@ -2,6 +2,152 @@ use custos::service::{generate_launchd_plist, generate_windows_sc_create_args};
 use std::path::Path;
 
 #[test]
+fn cli_replay_drains_more_than_one_analysis_work_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let ledger = dir.path().join("ledger");
+    let mut cfg = custos::config::AppConfig::default();
+    cfg.daemon.decisions_file = ledger.clone();
+    cfg.firewall.enabled = false;
+    cfg.jev.max_actors_per_batch = 1;
+    cfg.memory.analysis_batches_per_flush = 1;
+    custos::service::write_secret_file(&config, toml::to_string(&cfg).unwrap().as_bytes()).unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_custos"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "replay",
+            "--log",
+            "tests/fixtures/sample_access.log",
+            "--mock-jev",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Jev L2 Actor Verdicts (4)"));
+    assert_eq!(
+        custos::store::DecisionStore::open(ledger, 3600)
+            .unwrap()
+            .active_count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn daemon_honors_both_decision_capacity_policies() {
+    use custos::{
+        config::{AppConfig, DecisionCapacityPolicy, LogFormat, LogSourceConfig},
+        store::{DecisionSource, DecisionStore},
+    };
+    use std::{
+        process::{Child, Command, Stdio},
+        time::Duration,
+    };
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for (policy, expected) in [
+        (DecisionCapacityPolicy::FailClosed, 503),
+        (DecisionCapacityPolicy::EnforceExisting, 200),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger");
+        let config = dir.path().join("config.toml");
+        let log = dir.path().join("access.log");
+        std::fs::write(&log, "").unwrap();
+        let store = DecisionStore::open_with_limit(ledger.clone(), 3600, 1).unwrap();
+        store
+            .upsert_ban(
+                "198.51.100.1".parse().unwrap(),
+                "test".into(),
+                DecisionSource::ManualAdmin,
+                1.,
+                1.,
+                "test".into(),
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cfg = AppConfig::default();
+        cfg.daemon.decisions_file = ledger.clone();
+        cfg.daemon.bouncer_listen = format!("127.0.0.1:{port}");
+        cfg.daemon.on_decision_capacity = policy;
+        cfg.memory.max_decisions = 1;
+        cfg.firewall.enabled = false;
+        cfg.logs = vec![LogSourceConfig {
+            path: log,
+            format: LogFormat::Json,
+        }];
+        custos::service::write_secret_file(&config, toml::to_string(&cfg).unwrap().as_bytes())
+            .unwrap();
+        let mut daemon = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_custos"))
+                .args(["--config", config.to_str().unwrap(), "run", "--mock-jev"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let check = format!("http://127.0.0.1:{port}/v1/bouncer/check");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(
+                    daemon.0.try_wait().unwrap().is_none(),
+                    "daemon exited before serving requests"
+                );
+                if let Ok(response) = client
+                    .get(&check)
+                    .query(&[("ip", "198.51.100.2")])
+                    .send()
+                    .await
+                {
+                    assert_eq!(response.status().as_u16(), expected);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .get(&check)
+                .query(&[("ip", "198.51.100.1")])
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            403
+        );
+        drop(daemon);
+        assert_eq!(
+            DecisionStore::open_with_limit(ledger, 3600, 1)
+                .unwrap()
+                .active_count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn launchd_manifest_never_contains_api_credentials() {
     let plist = generate_launchd_plist(
         Path::new("/usr/local/bin/custos"),

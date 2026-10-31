@@ -38,6 +38,28 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 ---
 
+## Unreleased: Availability at saturation
+
+A full decision ledger now defaults to `daemon.on_decision_capacity = "enforce_existing"`: existing bans and validated cached signatures still reject requests, while unbanned clients remain eligible for admission. New durable bans are refused until cleanup frees slots. Set `"fail_closed"` to retain v0.3.0's strict HTTP 503 policy. Ingestion and HTTP concurrency limits remain independent and can still return overload errors.
+
+Capacity pressure wakes a coalesced background worker, at most once per second, for bounded expiry cleanup. PF/nftables use bulk deletes and ipset uses restore input; Windows uses bounded individual removals. Cleanup is acknowledged with one durable journal sync per group, only after confirmed removal. Both daemon and embedded pipelines also retry durable enforcement in the background; explicit reconciliation processes bounded groups without locking the whole sweep.
+
+The journal now records whether real kernel cleanup is required. Old records conservatively require it. Switching live state to dry-run or disabling the firewall cannot acknowledge its kernel cleanup; startup reports an error if inherited cleanup cannot be performed. Decisions created entirely in HTTP-only/dry-run mode remain reclaimable, and switching them to live enforcement durably marks the obligation before applying a rule. Preserve the journal when changing modes.
+
+Analysis evidence has count/byte limits, a five-minute age limit measured from the latest local observation, fair retries, and a per-flush work budget. Retries cannot extend evidence lifetime. Historical log replay remains supported: log timestamps still define traffic windows, while local monotonic time defines evidence age. Expired or displaced uncommitted evidence is counted; durable bans and cleanup never depend on this queue. A forced flush bypasses retry delays but still respects age and work budgets; repeat it until pending work is drained when replaying large files.
+
+Hub candidate budgets and per-authenticated-reporter quotas prevent one reporter from occupying every pending slot. Unconfirmed votes expire after 60 seconds by default; signatures retain their one-hour promoted lifetime. Existing candidates can complete quorum even at candidate capacity, and active promotions are never evicted for new votes. Total IP/signature bounds remain unchanged.
+
+Sustained validation on macOS (development build, isolated workers):
+
+| Profile | Duration | Attack events | Healthy checks allowed | Peak RSS |
+| :--- | ---: | ---: | ---: | ---: |
+| Full ledger + failed cleanup + provider outage | 60.1 s | 130,879 | 4,288 / 4,288 | 15.3 MiB |
+| Memory saturation, small limits | 60.9 s | 442,000 | — | 18.3 MiB |
+| Memory saturation, default limits | 82.1 s | 24,000 | — | 30.1 MiB |
+
+The site profile also passed all 4,288 existing-ban checks and 4,288 signature checks, preserved 32 active bans and 32 failed cleanup obligations across journal reopening, and reclaimed only confirmed cleanup after recovery. These profiles use simulated firewall execution and provider failure; they measure retained-state behavior, not native firewall throughput or a universal host memory ceiling.
+
 ## v0.3.0: Memory Limits and Screening Hardening
 
 [Download v0.3.0](https://github.com/george-amir/Custos/releases/tag/v0.3.0) for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), or Windows (x86_64).
@@ -49,7 +71,7 @@ Validation includes 95 passing tests and isolated sustained-load runs: 612,000 s
 ### Upgrading from v0.2.x
 
 - **Configuration:** existing TOML files receive defaults for the new `[memory]` section. Review `config.example.toml`; the 64 MiB window reservation budget is separate from queue, ban, and Hub limits and is not a process RSS ceiling.
-- **Overload:** existing bans and cleanup obligations are preserved. New admissions can fail at capacity; embedded requests and bouncer checks for unknown clients return HTTP 503 when the decision store is full. Include static assets when sizing the flood threshold.
+- **Overload in v0.3.0:** existing bans and cleanup obligations are preserved; unknown clients receive HTTP 503 at decision capacity. The unreleased changes above introduce the configurable availability policy. Include static assets when sizing the flood threshold.
 - **Persistence:** the journal must fit the configured decision capacity; reasons are limited to 512 bytes, threat names to 64 bytes, and journal records to 4 KiB. Startup rejects incompatible records explicitly. Preserve cleanup obligations when migrating or changing limits.
 - **Embedded Rust applications:** update explicit `AppConfig`/`WindowConfig` struct literals for the new fields or use `..Default::default()`. Handle overload errors from `submit_event`; use `spawn_pipeline_tailer` for byte-budgeted file ingestion or `visit_log_file` for streaming replay. The bulk `replay_log_file` helper collects caller-owned events.
 - **Hub deployments:** upgrade Hub and nodes together to use capacity acknowledgements and retries. The wire protocol adds `PushAck.rejected_capacity` and `rejected_invalid`; requests are limited to 256 signals and 256 KiB. Vote/signature retention, per-entry voter limits, and subscription limits now apply.
@@ -108,7 +130,7 @@ HTTP inspection decodes at most two percent-encoding layers and recognizes SQL c
 
 Input limits are 64 KiB per log record, 8 KiB for the inspected path/query, 1 KiB for User-Agent, and 32 bytes for the method. Oversized HTTP fields are truncated before queuing and marked for analysis; oversized log records are discarded through their newline. Per-window samples are capped at 32 and distinct-path fingerprints at 1,024, including when larger counts are configured. `window.max_state_bytes` reserves space conservatively for active and expired windows and may reduce capacity below `max_tracked_ips`; it is not a total process memory limit. The minimum reservation is one active/expired window pair.
 
-Custos currently evaluates access-log metadata after a request completes. Bodies, cookies, raw protocol headers, and application authorization context are not inspected. Use application authorization and an upstream WAF for controls that must reject an initial exploit request.
+Behavioral analysis evaluates access-log metadata after a request completes. Embedded middleware can reject existing IP bans and validated cached signatures before the handler; standalone signature checks require original request metadata from the trusted proxy. Bodies, cookies, raw protocol headers, and application authorization context are not inspected. Use application authorization and an upstream WAF for controls that must reject an initial exploit request.
 
 ---
 
@@ -116,10 +138,10 @@ Custos currently evaluates access-log metadata after a request completes. Bodies
 
 `window.max_state_bytes` bounds window reservations. The `[memory]` settings separately bound retained bans/cleanup, ingestion, provider responses, and Hub state. They do not impose a total process RSS ceiling.
 
-- Active bans and pending firewall cleanup share `max_decisions` slots (10,000 by default). New bans fail at capacity; existing bans and cleanup obligations are preserved. Embedded HTTP admission and bouncer checks for unknown clients return `503` while the decision store is full. Cleanup frees slots only after success. Ban reasons are limited to 512 bytes and threat names to 64 bytes. Loading a journal that exceeds capacity or contains an oversized record fails explicitly; size limits apply during replay before parsing.
+- Active bans and pending firewall cleanup share `max_decisions` slots (10,000 by default). New bans fail at capacity; existing bans and cleanup obligations are preserved. The default `enforce_existing` policy keeps unbanned clients eligible for HTTP admission; `fail_closed` returns `503` at decision capacity. Existing IP bans and cached signatures still block. Cleanup frees slots only after confirmed removal and durable acknowledgment; native timeout alone never discards an obligation. Ban reasons are limited to 512 bytes and threat names to 64 bytes. Loading a journal that exceeds capacity or contains an oversized record fails explicitly; size limits apply during replay before parsing.
 - Ingestion reserves 12 KiB per queued/running event or outstanding HTTP permit against an 8 MiB default budget, with at most 1,024 channel slots. Public `submit_event` returns an overload error rather than accumulating waiting producers. CLI replay streams records through `visit_log_file` instead of collecting the log. The explicit bulk `replay_log_file` helper returns a caller-owned vector and scales with file size. File readers backpressure directly into this queue; the daemon has no intermediate event queue and supports at most 16 log sources. Reader batches target 64 KiB, plus at most one record. The legacy `spawn_log_tailer` API uses a caller-owned channel; size that channel explicitly or prefer `spawn_pipeline_tailer`.
-- Jev response bodies, including HTTP error bodies and chunked responses, stop at 256 KiB by default. Batches contain at most 64 actors. Invalid or oversized replies retain the pending analysis batch for retry.
-- Hub IP votes/promotions share 10,000 slots; signatures share 1,024 slots. Votes below quorum and signatures expire after one hour by default; promoted IPs keep their explicit expiry. Each entry has at most 64 voters, node identities are bounded, and signature targets are limited to 256 bytes. `PushAck.rejected_capacity` and `rejected_invalid` report refusals. The reconnecting client retains capacity-rejected batches for retry. Existing live deltas remain available to slow subscribers; history is bounded by live state.
+- Jev response bodies, including HTTP error bodies and chunked responses, stop at 256 KiB by default. Batches contain at most 64 actors. Invalid or oversized replies retain evidence for fair, bounded retries. Pending work is capped at 4,096 actors and 16 MiB of conservative evidence/verdict reservations. The five-minute monotonic age limit starts at the latest local observation, including time waiting in windows; retries never reset it. Each flush attempts at most 16 batches. Retries isolate individual actors to keep a malformed actor from poisoning its former batch mates. Concurrent flushes return a busy error instead of accumulating waiters; cancellation cannot accumulate detached enforcement jobs.
+- Hub IP votes/promotions share 10,000 slots; signatures share 1,024 slots. At most 2,500 IP candidates and 256 signature candidates can be pending, within the existing total bounds. Per reporter, pending votes are capped at the smaller of 1,000 and half the relevant candidate budget (rounded up); completing quorum bypasses that reporter quota. Votes below quorum expire after 60 seconds or `hub_retention_secs`, whichever is shorter. Promoted signatures retain their one-hour lifetime; promoted IPs keep their explicit expiry. Each entry has at most 64 voters, node identities are bounded, and signature targets are limited to 256 bytes. `PushAck.rejected_capacity` and `rejected_invalid` report refusals. The reconnecting client retains capacity-rejected batches for retry. Existing live deltas remain available to slow subscribers; history is bounded by live state.
 - Hub wire messages are limited to 256 KiB inbound and 4 MiB outbound. There are at most 16 intel subscriptions with a one-message buffer each; the HTTP bouncer API admits at most 16 response bodies at once. Saturated clients receive explicit overload errors. Local signature caches also have capacity and expiry limits.
 
 An existing journal must fit the configured decision and record limits before startup. Preserve the journal and its cleanup obligations when changing limits; a smaller limit does not silently discard records. Set a service/container memory limit and web-server connection/request limits for host isolation; application handlers, caller-owned data, networking, and allocator overhead are outside these retained-state budgets.
@@ -128,10 +150,10 @@ The isolated stress test runs automatically with the regression suite. For longe
 
 ```sh
 CUSTOS_STRESS_SECONDS=60 cargo test --test ddos_stress -- --nocapture
-CUSTOS_STRESS_DEFAULTS=1 CUSTOS_STRESS_SECONDS=60 cargo test --test ddos_stress -- --nocapture
+CUSTOS_STRESS_DEFAULTS=1 CUSTOS_STRESS_SECONDS=60 cargo test --test ddos_stress sustained_ddos_memory_plateaus -- --nocapture
 ```
 
-It simulates distinct attacking IPs, long URLs and headers, ban saturation, signature churn, Hub quorum/expiry, queue pressure, and failed analysis retries. It asserts per-component admission limits, Rust heap stability after warm-up, and process resident-memory high-water bounds. These are repeatable load profiles, not a universal memory ceiling for every deployment.
+It simulates distinct attacking IPs, long URLs and headers, ban saturation, signature churn, Hub quorum/expiry, queue pressure, and failed analysis retries. It asserts per-component admission limits, Rust heap stability after warm-up, and process resident-memory high-water bounds. A separate saturation worker combines concurrent attack producers, a full ledger, failed kernel cleanup, a provider outage, and noisy Hub reporting. It continuously checks healthy HTTP admission, existing bans and signatures, then reopens the journal and verifies cleanup recovery. Firewall operations in these profiles use an injected kernel model; native command builders and partial failures have separate regression coverage. These are repeatable load profiles, not a universal memory ceiling for every deployment.
 
 
 ## 🚀 Quick Start
@@ -341,6 +363,8 @@ Even when OS firewall mode is disabled or running in `dry_run = true`, any rever
 - Returns **`200 OK`** (`{"action": "allow"}`) for benign IPs.
 - Returns **`403 Forbidden`** (`{"action": "block", "threat_class": "..."}`) with header `X-Custos-Threat: <threat_class>` for banned IPs.
 
+To reject cached signatures through the standalone checker, the proxy must overwrite both `X-Original-Method` and `X-Original-URI` with the protected request's values. Missing both preserves IP-only checks; incomplete/invalid metadata returns `400`. Trusted headers take precedence over optional `method`/`uri` query parameters. Keep this API reachable only by trusted proxies. The examples below follow [Nginx auth subrequests](https://nginx.org/en/docs/http/ngx_http_auth_request_module.html) and [Caddy's original-request forwarding](https://caddyserver.com/docs/caddyfile/directives/forward_auth).
+
 ### Nginx (`ngx_http_auth_request_module`)
 ```nginx
 server {
@@ -352,10 +376,12 @@ server {
 
     location = /_custos_check {
         internal;
-        proxy_pass http://127.0.0.1:8085/v1/bouncer/check;
+        proxy_pass http://127.0.0.1:8085/v1/bouncer/check?ip=$remote_addr;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Original-URI $request_uri;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
@@ -371,6 +397,8 @@ example.com {
     forward_auth 127.0.0.1:8085 {
         uri /v1/bouncer/check
         header_up X-Real-IP {remote_host}
+        header_up X-Original-Method {method}
+        header_up X-Original-URI {uri}
     }
     reverse_proxy 127.0.0.1:3000
 }
@@ -510,6 +538,13 @@ Scrape `http://127.0.0.1:8085/metrics` with Prometheus, Grafana Agent, or Vector
 | `custos_jev_actors_evaluated_total` | `counter` | Total suspicious actors evaluated by Jev |
 | `custos_jev_input_tokens_total` | `counter` | Total Jev input tokens consumed |
 | `custos_active_bans` | `gauge` | Current active IP bans in `DecisionStore` |
+| `custos_decision_retained` / `custos_decision_cleanup_pending` | `gauge` | Total retained slots / cleanup obligations |
+| `custos_decision_saturated` | `gauge` | 1 while the retained decision ledger is full |
+| `custos_decision_capacity_rejected_total` | `counter` | Actual new-ban admission refusals |
+| `custos_decision_capacity_allowed_total` / `custos_decision_capacity_blocked_total` | `counter` | Admissions allowed/refused by the saturated decision policy |
+| `custos_analysis_pending_actors` / `custos_analysis_pending_bytes` | `gauge` | Pending analysis count / reserved bytes |
+| `custos_analysis_expired_total` / `custos_analysis_capacity_dropped_total` | `counter` | Uncommitted evidence expired / displaced at capacity |
+| `custos_analysis_retried_total` | `counter` | Actor retries scheduled |
 | `custos_auto_cached_signatures` | `gauge` | Current zero-day L1 signatures cached in memory |
 | `custos_firewall_rules_applied_total` | `counter` | Total OS kernel firewall rules applied |
 | `custos_firewall_rules_removed_total` | `counter` | Total OS kernel firewall rules removed |
@@ -526,6 +561,7 @@ See [`config.example.toml`](config.example.toml) for a complete annotated config
 | `daemon.bouncer_listen` | `"127.0.0.1:8085"` | — | Local bind address for the HTTP Bouncer & `/metrics` API |
 | `daemon.decisions_file` | `"decisions.jsonl"` | — | Append-only JSONL persistence file (auto-compacted every 60s) |
 | `daemon.default_ban_ttl_secs` | `3600` | — | Default ban duration in seconds |
+| `daemon.on_decision_capacity` | `"enforce_existing"` | — | Allow unbanned HTTP clients at ledger capacity, or select `"fail_closed"` |
 | `daemon.trusted_proxies` | `[]` | — | Exact trusted proxy socket IPs for embedded middleware |
 | `daemon.api_token` | `""` | `CUSTOS_API_TOKEN` | Required Bearer token for admin mutations; empty disables mutations |
 | `firewall.enabled` | `true` | — | Enable OS firewall command generation/enforcement |
@@ -543,8 +579,17 @@ See [`config.example.toml`](config.example.toml) for a complete annotated config
 | `memory.max_provider_response_bytes` | `262144` | — | Maximum Jev response body (256 KiB) |
 | `memory.hub_max_entries` | `10000` | — | Hub IP vote and promotion slots |
 | `memory.max_signatures` | `1024` | — | Hub and local cache signature slots |
-| `memory.hub_retention_secs` | `3600` | — | Unpromoted vote and signature retention |
+| `memory.hub_retention_secs` | `3600` | — | Promoted signature retention and upper bound on unconfirmed vote retention |
 | `memory.hub_max_streams` | `16` | — | Simultaneous Hub intel subscriptions |
+| `memory.max_pending_actors` | `4096` | — | Maximum retained analysis actors |
+| `memory.max_pending_bytes` | `16777216` | — | Conservative pending evidence and cached-verdict reservations |
+| `memory.analysis_ttl_secs` | `300` | — | Evidence age from latest local observation; range 1–86400 |
+| `memory.analysis_retry_secs` | `1` | — | Initial retry delay; exponential backoff caps at 60 seconds |
+| `memory.analysis_batches_per_flush` | `16` | — | Maximum analysis/apply batches attempted per flush |
+| `memory.hub_max_pending_entries` | `2500` | — | Pending IP candidate cap within `hub_max_entries` |
+| `memory.hub_max_pending_signatures` | `256` | — | Pending signature candidate cap within `max_signatures` |
+| `memory.hub_max_pending_per_node` | `1000` | — | Reporter quota, additionally capped at half the candidate budget |
+| `memory.hub_vote_ttl_secs` | `60` | — | Unconfirmed vote TTL, also capped by `hub_retention_secs` |
 | `jev.endpoint` | `"https://api.typesafe.ai/v1/systemone"` | — | TypeSafe Jev System-1 API endpoint |
 | `jev.api_key` | `""` | `TYPESAFE_API_KEY` | TypeSafe AI Bearer API key |
 | `jev.max_actors_per_batch` | `25` | — | Max suspicious actors packed into a single `/v1/systemone` call |

@@ -56,6 +56,9 @@ pub struct FirewallConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
+    /// Policy for unbanned HTTP clients when the durable decision ledger is full.
+    #[serde(default)]
+    pub on_decision_capacity: DecisionCapacityPolicy,
     /// Exact proxy peer addresses allowed to supply forwarding headers.
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
@@ -67,6 +70,14 @@ pub struct DaemonConfig {
     pub default_ban_ttl_secs: u64,
     #[serde(default)]
     pub api_token: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionCapacityPolicy {
+    #[default]
+    EnforceExisting,
+    FailClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +241,7 @@ impl Default for FirewallConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            on_decision_capacity: DecisionCapacityPolicy::default(),
             trusted_proxies: Vec::new(),
             bouncer_listen: default_bouncer_listen(),
             decisions_file: default_decisions_file(),

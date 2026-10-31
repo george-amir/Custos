@@ -4,6 +4,9 @@
 bouncer_listen = "127.0.0.1:8085"
 decisions_file = "decisions.jsonl"
 default_ban_ttl_secs = 3600
+# Keep existing bans/signatures enforced while allowing unbanned clients at ledger capacity.
+# Choose "fail_closed" for the strict HTTP 503 policy. Other admission limits still apply.
+on_decision_capacity = "enforce_existing"
 # Bearer token required for mutating API endpoints (POST/DELETE /v1/decisions).
 # Empty disables admin mutations (503); read-only bouncer checks remain available.
 # Can also be set via CUSTOS_API_TOKEN environment variable
@@ -90,3 +93,17 @@ hub_max_entries = 10000
 max_signatures = 1024
 hub_retention_secs = 3600
 hub_max_streams = 16
+
+# Analysis evidence only; durable bans and cleanup are never evicted by these caps.
+max_pending_actors = 4096
+max_pending_bytes = 16777216
+# Monotonic age since latest local observation, including time in a window (1..86400).
+analysis_ttl_secs = 300
+analysis_retry_secs = 1
+analysis_batches_per_flush = 16
+# Candidate sub-budgets stay inside hub_max_entries/max_signatures.
+hub_max_pending_entries = 2500
+hub_max_pending_signatures = 256
+# Effective reporter quota is also capped at half its candidate budget, rounded up.
+hub_max_pending_per_node = 1000
+hub_vote_ttl_secs = 60

@@ -5,6 +5,7 @@
 bouncer_listen = "127.0.0.1:8085"
 decisions_file = "/var/lib/custos/decisions.jsonl"
 default_ban_ttl_secs = 3600
+on_decision_capacity = "enforce_existing"
 
 [[logs]]
 path = "/var/log/nginx/access.log"

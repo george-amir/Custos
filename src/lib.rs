@@ -1,4 +1,6 @@
+pub mod analysis;
 pub mod bouncer_api;
+mod cleanup;
 pub mod config;
 pub mod firewall;
 pub mod hub;
@@ -14,15 +16,14 @@ pub mod tailer;
 pub mod window;
 pub mod windows_service;
 
-use crate::config::{AppConfig, FirewallConfig, JevConfig, WindowConfig};
+use crate::config::{AppConfig, DecisionCapacityPolicy, FirewallConfig, JevConfig, WindowConfig};
 use crate::firewall::{FirewallBackend, FirewallBouncer};
 use crate::jev::{ActorVerdict, JevBatchAnalyzer};
-use crate::sanitizer::ActorStateSummary;
 use crate::store::{BanDecision, DecisionSource, DecisionStore};
 use crate::tailer::AccessLogEvent;
 use crate::window::{L1Disposition, SlidingWindowEngine};
 use anyhow::Result;
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -105,6 +106,7 @@ impl CustosBuilder {
         let firewall = Arc::new(FirewallBouncer::new(self.config.firewall));
         let mut pipeline = SecurityPipeline::new_with_limits(store, window, jev, firewall, limits)?;
         pipeline.trusted_proxies = Arc::new(self.config.daemon.trusted_proxies);
+        pipeline.on_decision_capacity = self.config.daemon.on_decision_capacity;
         Ok(pipeline)
     }
 }
@@ -138,10 +140,17 @@ pub struct SecurityPipeline {
     pub jev: Arc<JevBatchAnalyzer>,
     pub firewall: Arc<FirewallBouncer>,
     pub trusted_proxies: Arc<Vec<IpAddr>>,
+    pub on_decision_capacity: DecisionCapacityPolicy,
     enforcement: Arc<Mutex<()>>,
+    cleanup: Option<cleanup::CleanupWorker>,
+    pub capacity_allowed: Arc<std::sync::atomic::AtomicU64>,
+    pub capacity_blocked: Arc<std::sync::atomic::AtomicU64>,
     queue_budget: Arc<tokio::sync::Semaphore>,
     pub queue_rejected: Arc<std::sync::atomic::AtomicU64>,
-    pending: Arc<tokio::sync::Mutex<VecDeque<ActorStateSummary>>>,
+    pending: Arc<tokio::sync::Mutex<analysis::PendingQueue>>,
+    limits: Arc<limits::MemoryLimits>,
+    pub analysis_metrics: Arc<analysis::AnalysisMetrics>,
+    analysis_work: Arc<tokio::sync::Semaphore>,
     ingestion: Option<tokio::sync::mpsc::Sender<IngestionMessage>>,
 }
 
@@ -180,13 +189,25 @@ impl SecurityPipeline {
             jev,
             firewall,
             trusted_proxies: Arc::new(Vec::new()),
+            on_decision_capacity: DecisionCapacityPolicy::default(),
             enforcement: Arc::new(Mutex::new(())),
+            cleanup: None,
+            capacity_allowed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            capacity_blocked: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             queue_budget: Arc::new(tokio::sync::Semaphore::new(limits.event_queue_bytes)),
             queue_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            pending: Arc::new(tokio::sync::Mutex::new(analysis::PendingQueue::default())),
+            limits: Arc::new(limits.clone()),
+            analysis_metrics: Arc::new(analysis::AnalysisMetrics::default()),
+            analysis_work: Arc::new(tokio::sync::Semaphore::new(1)),
             ingestion: None,
         };
         pipeline.reconcile_firewall()?;
+        pipeline.cleanup = Some(cleanup::CleanupWorker::start(
+            pipeline.store.clone(),
+            pipeline.firewall.clone(),
+            pipeline.enforcement.clone(),
+        )?);
         let (tx, mut rx) = tokio::sync::mpsc::channel(limits.event_queue_capacity);
         // The worker owns no sender, so dropping all public pipelines closes it.
         let worker = pipeline.clone();
@@ -196,7 +217,9 @@ impl SecurityPipeline {
                 while let Some(message) = rx.blocking_recv() {
                     match message {
                         IngestionMessage::Event(event, oversized, _memory) => {
-                            if let Err(error) = worker.process_event_bounded(&event, oversized) {
+                            if let Err(error) = worker.process_event_bounded(&event, oversized)
+                                && !error.is::<store::DecisionCapacityExceeded>()
+                            {
                                 warn!(%error, "Failed to ingest queued request");
                             }
                         }
@@ -218,7 +241,7 @@ impl SecurityPipeline {
 
     /// Reserve bounded ingestion capacity before executing an HTTP handler.
     pub fn reserve_event(&self) -> Result<EventPermit> {
-        if self.store.is_at_capacity() {
+        if !self.capacity_allows_traffic() {
             anyhow::bail!("Decision capacity reached");
         }
         let result = (|| {
@@ -239,6 +262,28 @@ impl SecurityPipeline {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         result
+    }
+
+    /// Capacity policy is independent of ingestion and request concurrency limits.
+    pub fn capacity_allows_traffic(&self) -> bool {
+        if !self.store.is_at_capacity() {
+            return true;
+        }
+        self.request_cleanup();
+        let allowed = self.on_decision_capacity == DecisionCapacityPolicy::EnforceExisting;
+        let metric = if allowed {
+            &self.capacity_allowed
+        } else {
+            &self.capacity_blocked
+        };
+        metric.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        allowed
+    }
+
+    pub fn request_cleanup(&self) {
+        if let Some(worker) = &self.cleanup {
+            worker.request();
+        }
     }
 
     /// Nonblocking admission: overload returns an error instead of retaining waiting producers.
@@ -278,11 +323,48 @@ impl SecurityPipeline {
         reason: String,
         ttl: Option<u64>,
     ) -> Result<BanDecision> {
+        // A full ledger can reject new identities without waiting behind a slow
+        // firewall command. upsert_ban rechecks under its mutation lock.
+        if let Err(error) = self.store.admit(&ip) {
+            self.request_cleanup();
+            return Err(error);
+        }
         let _guard = self.enforcement_guard()?;
-        let decision = self
-            .store
-            .upsert_ban(ip, threat, source, noul, confidence, reason, ttl)?;
-        self.firewall.ban_ip(ip, remaining_ttl(&decision))?;
+        self.record_ban_locked(ip, threat, source, noul, confidence, reason, ttl)
+    }
+
+    /// Caller holds enforcement_guard across persistence and the OS command.
+    #[allow(clippy::too_many_arguments)]
+    fn record_ban_locked(
+        &self,
+        ip: IpAddr,
+        threat: String,
+        source: DecisionSource,
+        noul: f64,
+        confidence: f64,
+        reason: String,
+        ttl: Option<u64>,
+    ) -> Result<BanDecision> {
+        let result = self.store.upsert_ban_with_kernel(
+            ip,
+            threat,
+            source,
+            noul,
+            confidence,
+            reason,
+            ttl,
+            self.firewall.is_enabled() && !self.firewall.is_dry_run(),
+        );
+        if result.is_err() && self.store.is_at_capacity() {
+            self.request_cleanup();
+        }
+        let decision = result?;
+        if let Err(error) = self.firewall.ban_ip(ip, remaining_ttl(&decision)) {
+            if let Some(worker) = &self.cleanup {
+                worker.retry_enforcement();
+            }
+            return Err(error);
+        }
         Ok(decision)
     }
 
@@ -291,7 +373,13 @@ impl SecurityPipeline {
         let removed = self.store.remove_ban(ip)?;
         // Retry an earlier failed removal as well as a newly removed decision.
         if removed || self.store.sweep_expired().contains(ip) {
-            self.firewall.unban_ip(*ip)?;
+            if self.store.cleanup_requires_kernel(ip) {
+                anyhow::ensure!(
+                    self.firewall.is_enabled() && !self.firewall.is_dry_run(),
+                    "Live or legacy kernel cleanup retained: enable live firewall enforcement to confirm removal"
+                );
+                self.firewall.unban_ip(*ip)?;
+            }
             self.store.acknowledge_cleanup(ip)?;
             return Ok(true);
         }
@@ -300,28 +388,34 @@ impl SecurityPipeline {
 
     /// Retry desired enforcement and retain failed cleanup obligations for the next pass.
     pub fn reconcile_firewall(&self) -> Result<()> {
-        let _guard = self.enforcement_guard()?;
         let mut failures = Vec::new();
-        for ip in self.store.sweep_expired() {
-            if self.store.check_ip(&ip).is_none() {
-                match self
-                    .firewall
-                    .unban_ip(ip)
-                    .and_then(|_| self.store.acknowledge_cleanup(&ip).map(|_| ()))
-                {
-                    Ok(()) => {}
-                    Err(error) => failures.push(error.to_string()),
-                }
+        for group in self
+            .store
+            .sweep_expired()
+            .chunks(self.firewall.cleanup_chunk_size())
+        {
+            if let Err(error) =
+                cleanup::cleanup_group(&self.store, &self.firewall, &self.enforcement, group)
+            {
+                failures.push(error.to_string());
             }
         }
-        let entries: Vec<_> = self
-            .store
-            .list_active()
-            .iter()
-            .map(|d| (d.ip, remaining_ttl(d)))
-            .collect();
-        if let Err(error) = self.firewall.ban_ips_batch(&entries) {
-            failures.push(error.to_string());
+        let active = self.store.list_active();
+        for group in active.chunks(self.firewall.enforcement_chunk_size()) {
+            let _guard = self.enforcement_guard()?;
+            let entries: Vec<_> = group
+                .iter()
+                .filter_map(|old| self.store.check_ip(&old.ip))
+                .map(|d| (d.ip, remaining_ttl(&d)))
+                .collect();
+            if self.firewall.is_enabled() && !self.firewall.is_dry_run() {
+                self.store.require_kernel_cleanup(
+                    &entries.iter().map(|(ip, _)| *ip).collect::<Vec<_>>(),
+                )?;
+            }
+            if let Err(error) = self.firewall.ban_ips_batch(&entries) {
+                failures.push(error.to_string());
+            }
         }
         if !failures.is_empty() {
             anyhow::bail!("Firewall reconciliation failed: {}", failures.join("; "));
@@ -355,36 +449,70 @@ impl SecurityPipeline {
         Ok(())
     }
 
-    fn apply_verdicts(&self, verdicts: &[ActorVerdict]) -> Result<()> {
-        for v in verdicts.iter().filter(|v| v.should_ban) {
-            if self.store.check_ip(&v.client_ip).is_none() {
-                self.record_ban(
-                    v.client_ip,
-                    v.threat_class.clone(),
-                    DecisionSource::JevSystemOne,
-                    v.noul_malicious_prob,
-                    v.choice_confidence,
-                    format!(
-                        "Jev verdict: {} (noul={:.2}, confidence={:.2})",
-                        v.threat_class, v.noul_malicious_prob, v.choice_confidence
-                    ),
-                    None,
-                )?;
-            } else {
-                // A prior attempt may have persisted the ban before enforcement failed.
-                self.reconcile_firewall()?;
+    fn apply_verdict(&self, v: &ActorVerdict, expires: std::time::Instant) -> Result<()> {
+        if !v.should_ban {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < expires,
+            "Analysis evidence expired before application"
+        );
+        if let Some((method, path)) = proven_signature_for_verdict(v) {
+            self.window
+                .register_auto_signature(&method, &path, &v.threat_class);
+            info!(%method, %path, "Cached validated exploit signature");
+        }
+        if self.store.check_ip(&v.client_ip).is_none()
+            && let Err(error) = self.store.admit(&v.client_ip)
+        {
+            self.request_cleanup();
+            return Err(error);
+        }
+        let _guard = self.enforcement_guard()?;
+        anyhow::ensure!(
+            std::time::Instant::now() < expires,
+            "Analysis evidence expired while waiting for enforcement"
+        );
+        if let Some(decision) = self.store.check_ip(&v.client_ip) {
+            if self.firewall.is_enabled() && !self.firewall.is_dry_run() {
+                self.store.require_kernel_cleanup(&[v.client_ip])?;
             }
-            if let Some((method, path)) = proven_signature_for_verdict(v) {
-                self.window
-                    .register_auto_signature(&method, &path, &v.threat_class);
-                info!(%method, %path, "Cached validated exploit signature");
+            if let Err(error) = self.firewall.ban_ip(v.client_ip, remaining_ttl(&decision)) {
+                if let Some(worker) = &self.cleanup {
+                    worker.retry_enforcement();
+                }
+                return Err(error);
             }
+        } else {
+            self.record_ban_locked(
+                v.client_ip,
+                v.threat_class.clone(),
+                DecisionSource::JevSystemOne,
+                v.noul_malicious_prob,
+                v.choice_confidence,
+                format!(
+                    "Jev verdict: {} (noul={:.2}, confidence={:.2})",
+                    v.threat_class, v.noul_malicious_prob, v.choice_confidence
+                ),
+                None,
+            )?;
         }
         Ok(())
     }
 
-    /// Acknowledge each successful batch independently; retain failed actors for retry.
+    /// Analyze bounded fresh and retry work fairly. Forced flushing bypasses retry
+    /// delays, but never the age, count, byte, or per-call work limits.
     pub async fn flush_and_analyze(&self, force_all: bool) -> Result<Vec<ActorVerdict>> {
+        let mut work_permit = Some(
+            self.analysis_work
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| anyhow::anyhow!("Analysis application still in progress"))?,
+        );
+        let mut pending = self
+            .pending
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("Analysis flush already in progress"))?;
         if force_all {
             let (done, drained) = tokio::sync::oneshot::channel();
             self.ingestion
@@ -394,46 +522,120 @@ impl SecurityPipeline {
                 .await?;
             drained.await?;
         }
-        let mut pending = self.pending.lock().await;
+        pending.expire(&self.analysis_metrics);
+        for (summary, observed) in self.window.drain_suspicious_work(force_all) {
+            pending.admit(summary, observed, &self.limits, &self.analysis_metrics);
+        }
+        pending.publish(&self.analysis_metrics);
         let mut completed = Vec::new();
-        let mut drained_current_windows = false;
-        loop {
-            if pending.is_empty() {
-                if drained_current_windows {
-                    break;
-                }
-                pending.extend(self.window.drain_suspicious_summaries(force_all));
-                drained_current_windows = true;
-                if pending.is_empty() {
-                    break;
-                }
-            }
-            let chunk: Vec<_> = pending
-                .iter()
-                .take(self.jev.max_actors_per_batch())
-                .cloned()
-                .collect();
-            let result = self.jev.analyze_summaries(&chunk).await;
-            let verdicts = match result {
-                Ok(verdicts) => verdicts,
-                Err(error) if completed.is_empty() => return Err(error),
-                Err(error) => {
-                    warn!(%error, "Retained failed analysis batch for retry");
-                    break;
-                }
-            };
-            let worker = self.clone();
-            let apply = verdicts.clone();
-            let result = tokio::task::spawn_blocking(move || worker.apply_verdicts(&apply)).await?;
-            if let Err(error) = result {
-                if completed.is_empty() {
-                    return Err(error);
-                }
-                warn!(%error, "Retained unapplied verdict batch for retry");
+        let mut seen = HashSet::new();
+        let mut first_error = None;
+        for _ in 0..self.limits.analysis_batches_per_flush {
+            let ids = pending.select(&seen, self.jev.max_actors_per_batch(), force_all);
+            if ids.is_empty() {
                 break;
             }
-            pending.drain(..chunk.len());
-            completed.extend(verdicts);
+            seen.extend(ids.iter().copied());
+            let cached = pending
+                .items
+                .iter()
+                .find(|item| item.id == ids[0])
+                .and_then(|item| item.verdict.clone());
+            let verdicts = if let Some(verdict) = cached {
+                vec![verdict]
+            } else {
+                let chunk: Vec<_> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, id)| {
+                        let mut summary = pending
+                            .items
+                            .iter()
+                            .find(|item| item.id == *id)
+                            .expect("selected actor")
+                            .summary
+                            .clone();
+                        // Every outgoing batch gets unique keys, including merged drains.
+                        summary.actor_key = format!("actor_{idx}");
+                        summary
+                    })
+                    .collect();
+                match self.jev.analyze_summaries(&chunk).await {
+                    Ok(verdicts) => verdicts,
+                    Err(error) => {
+                        pending.retry(&ids, &self.limits, &self.analysis_metrics);
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                }
+            };
+            let mut apply_ids = Vec::new();
+            let mut apply = Vec::new();
+            for (id, verdict) in ids.iter().zip(verdicts) {
+                let item = pending
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == *id)
+                    .expect("selected actor");
+                if item.expires <= std::time::Instant::now() {
+                    continue;
+                }
+                item.verdict = Some(verdict.clone());
+                apply_ids.push(*id);
+                apply.push((verdict, item.expires));
+            }
+            let worker = self.clone();
+            let permit = work_permit.take().expect("analysis work permit");
+            let (results, permit) = tokio::task::spawn_blocking(move || {
+                let results = apply
+                    .into_iter()
+                    .map(|(verdict, expires)| {
+                        let result = if std::time::Instant::now() >= expires {
+                            Err(anyhow::anyhow!(
+                                "Analysis evidence expired before application"
+                            ))
+                        } else {
+                            worker.apply_verdict(&verdict, expires)
+                        };
+                        (verdict, result)
+                    })
+                    .collect::<Vec<_>>();
+                (results, permit)
+            })
+            .await?;
+            work_permit = Some(permit);
+            for (id, (verdict, result)) in apply_ids.into_iter().zip(results) {
+                match result {
+                    Ok(()) => {
+                        pending.remove(id);
+                        completed.push(verdict);
+                    }
+                    Err(error) => {
+                        // A persisted ban is now durable enforcement work. The background
+                        // worker retries it even if its original analysis evidence expires.
+                        if verdict.should_ban && self.store.check_ip(&verdict.client_ip).is_some() {
+                            pending.remove(id);
+                            warn!(%error, ip=%verdict.client_ip, "Durable ban awaits firewall retry");
+                            completed.push(verdict);
+                        } else {
+                            pending.retry(&[id], &self.limits, &self.analysis_metrics);
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+            }
+            pending.expire(&self.analysis_metrics);
+            pending.publish(&self.analysis_metrics);
+        }
+        pending.expire(&self.analysis_metrics);
+        pending.publish(&self.analysis_metrics);
+        if completed.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            if !pending.items.is_empty() {
+                anyhow::bail!("Analysis retries deferred or per-flush work budget reached");
+            }
         }
         Ok(completed)
     }

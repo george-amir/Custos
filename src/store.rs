@@ -31,6 +31,14 @@ pub struct BanDecision {
     pub reason: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// Legacy records conservatively require real kernel cleanup. HTTP-only
+    /// decisions can be reclaimed without pretending a simulated unban ran.
+    #[serde(default = "default_kernel_cleanup_required")]
+    pub kernel_cleanup_required: bool,
+}
+
+fn default_kernel_cleanup_required() -> bool {
+    true
 }
 
 impl BanDecision {
@@ -42,15 +50,25 @@ impl BanDecision {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum JournalOperation {
-    Remove { ip: IpAddr },
-    CleanupComplete { ip: IpAddr },
+    Remove {
+        ip: IpAddr,
+        #[serde(default = "default_kernel_cleanup_required")]
+        kernel_cleanup_required: bool,
+    },
+    CleanupComplete {
+        ip: IpAddr,
+    },
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("Decision capacity reached; existing bans and cleanup obligations retained")]
+pub struct DecisionCapacityExceeded;
 
 /// Concurrent reads with serialized, durable journal mutations. Expired entries
 /// remain in the ledger until their OS firewall cleanup has been acknowledged.
 pub struct DecisionStore {
     active_bans: DashMap<IpAddr, BanDecision>,
-    pending_cleanup: DashMap<IpAddr, ()>,
+    pending_cleanup: DashMap<IpAddr, bool>,
     persistence_path: PathBuf,
     default_ttl_secs: u64,
     max_decisions: usize,
@@ -124,10 +142,13 @@ impl DecisionStore {
                 )
             })?;
             match operation {
-                JournalOperation::Remove { ip } => {
+                JournalOperation::Remove {
+                    ip,
+                    kernel_cleanup_required,
+                } => {
                     self.admit(&ip)?;
                     self.active_bans.remove(&ip);
-                    self.pending_cleanup.insert(ip, ());
+                    self.pending_cleanup.insert(ip, kernel_cleanup_required);
                 }
                 JournalOperation::CleanupComplete { ip } => {
                     self.active_bans.remove(&ip);
@@ -156,6 +177,30 @@ impl DecisionStore {
         reason: String,
         custom_ttl_secs: Option<u64>,
     ) -> Result<BanDecision> {
+        self.upsert_ban_with_kernel(
+            ip,
+            threat_class,
+            source,
+            noul_probability,
+            confidence,
+            reason,
+            custom_ttl_secs,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_ban_with_kernel(
+        &self,
+        ip: IpAddr,
+        threat_class: String,
+        source: DecisionSource,
+        noul_probability: f64,
+        confidence: f64,
+        reason: String,
+        custom_ttl_secs: Option<u64>,
+        kernel_cleanup_required: bool,
+    ) -> Result<BanDecision> {
         self.validate_metadata(&threat_class, &reason)?;
         let now = Utc::now();
         let ttl = custom_ttl_secs.unwrap_or(self.default_ttl_secs).max(1);
@@ -163,7 +208,7 @@ impl DecisionStore {
             .ok()
             .and_then(Duration::try_seconds)
             .ok_or_else(|| anyhow!("Ban TTL is out of range"))?;
-        let decision = BanDecision {
+        let mut decision = BanDecision {
             ip,
             threat_class,
             source,
@@ -174,12 +219,14 @@ impl DecisionStore {
             expires_at: now
                 .checked_add_signed(duration)
                 .ok_or_else(|| anyhow!("Ban expiry is out of range"))?,
+            kernel_cleanup_required,
         };
         let _guard = self
             .mutation_lock
             .lock()
             .map_err(|_| anyhow!("Decision journal lock poisoned"))?;
         self.admit(&ip)?;
+        decision.kernel_cleanup_required |= self.cleanup_requires_kernel(&ip);
         self.append_record(&decision)?;
         self.pending_cleanup.remove(&ip);
         self.active_bans.insert(ip, decision.clone());
@@ -195,9 +242,13 @@ impl DecisionStore {
         if !self.active_bans.contains_key(ip) && !self.pending_cleanup.contains_key(ip) {
             return Ok(false);
         }
-        self.append_record(&JournalOperation::Remove { ip: *ip })?;
+        let kernel_cleanup_required = self.cleanup_requires_kernel(ip);
+        self.append_record(&JournalOperation::Remove {
+            ip: *ip,
+            kernel_cleanup_required,
+        })?;
         self.active_bans.remove(ip);
-        self.pending_cleanup.insert(*ip, ());
+        self.pending_cleanup.insert(*ip, kernel_cleanup_required);
         Ok(true)
     }
 
@@ -209,15 +260,51 @@ impl DecisionStore {
         self.retained_count() >= self.max_decisions
     }
 
-    fn admit(&self, ip: &IpAddr) -> Result<()> {
+    pub fn cleanup_requires_kernel(&self, ip: &IpAddr) -> bool {
+        self.active_bans
+            .get(ip)
+            .is_some_and(|decision| decision.kernel_cleanup_required)
+            || self
+                .pending_cleanup
+                .get(ip)
+                .is_some_and(|required| *required)
+    }
+
+    /// Persist before applying live rules to decisions created in HTTP-only mode.
+    /// A failed or partially applied OS command still requires eventual cleanup.
+    pub(crate) fn require_kernel_cleanup(&self, ips: &[IpAddr]) -> Result<()> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| anyhow!("Decision journal lock poisoned"))?;
+        let decisions: Vec<_> = ips
+            .iter()
+            .filter_map(|ip| {
+                let mut decision = self.active_bans.get(ip)?.value().clone();
+                if decision.kernel_cleanup_required {
+                    return None;
+                }
+                decision.kernel_cleanup_required = true;
+                Some(decision)
+            })
+            .collect();
+        if decisions.is_empty() {
+            return Ok(());
+        }
+        self.append_records(decisions.iter())?;
+        for decision in decisions {
+            self.active_bans.insert(decision.ip, decision);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit(&self, ip: &IpAddr) -> Result<()> {
         if !self.active_bans.contains_key(ip)
             && !self.pending_cleanup.contains_key(ip)
             && self.is_at_capacity()
         {
             self.capacity_rejected.fetch_add(1, Ordering::Relaxed);
-            anyhow::bail!(
-                "Decision capacity reached; existing bans and cleanup obligations retained"
-            );
+            return Err(DecisionCapacityExceeded.into());
         }
         Ok(())
     }
@@ -269,20 +356,39 @@ impl DecisionStore {
     /// The caller must serialize enforcement and cleanup so an old removal cannot
     /// race a newly applied ban. Active decisions are never acknowledged as cleaned.
     pub fn acknowledge_cleanup(&self, ip: &IpAddr) -> Result<bool> {
+        Ok(self.acknowledge_cleanup_batch(&[*ip])? != 0)
+    }
+
+    /// One durable sync per bounded group. No in-memory obligation is removed if
+    /// any journal write fails. The caller holds the enforcement lock throughout.
+    pub fn acknowledge_cleanup_batch(&self, ips: &[IpAddr]) -> Result<usize> {
         let _guard = self
             .mutation_lock
             .lock()
             .map_err(|_| anyhow!("Decision journal lock poisoned"))?;
-        if self.check_ip(ip).is_some() {
-            return Ok(false);
+        let mut eligible: Vec<_> = ips
+            .iter()
+            .copied()
+            .filter(|ip| {
+                self.check_ip(ip).is_none()
+                    && (self.active_bans.contains_key(ip) || self.pending_cleanup.contains_key(ip))
+            })
+            .collect();
+        eligible.sort_unstable();
+        eligible.dedup();
+        if eligible.is_empty() {
+            return Ok(0);
         }
-        if !self.active_bans.contains_key(ip) && !self.pending_cleanup.contains_key(ip) {
-            return Ok(false);
+        self.append_records(
+            eligible
+                .iter()
+                .map(|ip| JournalOperation::CleanupComplete { ip: *ip }),
+        )?;
+        for ip in &eligible {
+            self.active_bans.remove(ip);
+            self.pending_cleanup.remove(ip);
         }
-        self.append_record(&JournalOperation::CleanupComplete { ip: *ip })?;
-        self.active_bans.remove(ip);
-        self.pending_cleanup.remove(ip);
-        Ok(true)
+        Ok(eligible.len())
     }
 
     /// Atomically replaces the journal under the same lock as append operations.
@@ -315,7 +421,13 @@ impl DecisionStore {
                 write_record(&mut file, decision.value())?;
             }
             for ip in self.pending_cleanup.iter() {
-                write_record(&mut file, &JournalOperation::Remove { ip: *ip.key() })?;
+                write_record(
+                    &mut file,
+                    &JournalOperation::Remove {
+                        ip: *ip.key(),
+                        kernel_cleanup_required: *ip.value(),
+                    },
+                )?;
             }
             file.sync_all()?;
             drop(file);
@@ -343,6 +455,10 @@ impl DecisionStore {
 
     // Called only with mutation_lock held; persistence succeeds before memory changes.
     fn append_record(&self, record: &impl Serialize) -> Result<()> {
+        self.append_records(std::iter::once(record))
+    }
+
+    fn append_records(&self, records: impl IntoIterator<Item = impl Serialize>) -> Result<()> {
         let parent = self.parent_directory();
         std::fs::create_dir_all(parent)?;
         let existed = self.persistence_path.exists();
@@ -360,8 +476,13 @@ impl DecisionStore {
             )
         })?;
         let original_length = file.metadata()?.len();
-        let result =
-            write_record(&mut file, record).and_then(|_| file.sync_all().map_err(Into::into));
+        let result = (|| -> Result<()> {
+            for record in records {
+                write_record(&mut file, &record)?;
+            }
+            file.sync_all()?;
+            Ok(())
+        })();
         if let Err(error) = result {
             let _ = file.set_len(original_length);
             let _ = file.sync_all();

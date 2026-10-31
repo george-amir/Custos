@@ -25,6 +25,157 @@ fn batch(node: &str, token: &str, ip: [u8; 4]) -> SignalBatch {
     }
 }
 
+#[test]
+fn one_reporter_cannot_exhaust_candidate_slots_or_block_independent_quorum() {
+    use custos::{hub::proto::SignatureSignal, limits::MemoryLimits};
+    let hub = HubEngine::with_limits(
+        2,
+        MemoryLimits {
+            hub_max_entries: 16,
+            max_signatures: 16,
+            hub_max_pending_entries: 8,
+            hub_max_pending_signatures: 8,
+            hub_max_pending_per_node: 4,
+            ..Default::default()
+        },
+    );
+    let signal = |node: &str, n: u8| {
+        let mut batch = batch(node, "", [198, 51, 100, n]);
+        batch.signature_signals.push(SignatureSignal {
+            method: "GET".into(),
+            path_prefix: format!("/exploit/{n}"),
+            threat: 3,
+            confidence: 0.99,
+        });
+        batch
+    };
+    for n in 1..=100 {
+        let ack = hub.ingest_batch(signal("noisy", n));
+        assert_eq!(ack.rejected_capacity, if n <= 4 { 0 } else { 2 });
+    }
+    assert_eq!(hub.pending_counts(), (4, 4, 1, 1));
+    assert_eq!(
+        hub.ingest_batch(signal("honest-a", 200)).rejected_capacity,
+        0
+    );
+    assert_eq!(
+        hub.ingest_batch(signal("honest-b", 200)).rejected_capacity,
+        0
+    );
+    let delta = hub.pull_since(0);
+    assert_eq!(delta.ip_deltas.len(), 1);
+    assert_eq!(delta.signature_deltas.len(), 1);
+    // A reporter already at quota can still supply a vote completing quorum.
+    hub.ingest_batch(signal("honest-a", 1));
+    assert_eq!(hub.pull_since(0).ip_deltas.len(), 2);
+    assert_eq!(
+        hub.ingest_batch(signal("noisy", 5)).rejected_capacity,
+        0,
+        "promotion releases reporter accounting"
+    );
+}
+
+#[test]
+fn full_candidate_budget_still_allows_existing_candidates_to_promote_without_eviction() {
+    use custos::limits::MemoryLimits;
+    let hub = HubEngine::with_limits(
+        2,
+        MemoryLimits {
+            hub_max_entries: 4,
+            hub_max_pending_entries: 2,
+            ..Default::default()
+        },
+    );
+    hub.ingest_batch(batch("a", "", [198, 51, 100, 1]));
+    hub.ingest_batch(batch("b", "", [198, 51, 100, 2]));
+    assert_eq!(
+        hub.ingest_batch(batch("c", "", [198, 51, 100, 3]))
+            .rejected_capacity,
+        1
+    );
+    hub.ingest_batch(batch("a", "", [198, 51, 100, 2]));
+    hub.ingest_batch(batch("b", "", [198, 51, 100, 1]));
+    assert_eq!(hub.pull_since(0).ip_deltas.len(), 2);
+    assert_eq!(hub.pending_counts(), (0, 0, 0, 0));
+    // New candidates can use the freed candidate budget alongside promoted bans.
+    hub.ingest_batch(batch("c", "", [198, 51, 100, 3]));
+    assert_eq!(hub.pending_counts().0, 1);
+    assert_eq!(
+        hub.pull_since(0).ip_deltas.len(),
+        2,
+        "active promotions must never be evicted to admit votes"
+    );
+}
+
+#[test]
+fn candidate_ttl_is_shorter_than_promoted_retention_and_frees_reporter_accounting() {
+    use custos::{hub::proto::SignatureSignal, limits::MemoryLimits};
+    let clock = Arc::new(AtomicI64::new(100));
+    let now = clock.clone();
+    let hub = HubEngine::with_limits_and_clock(
+        2,
+        MemoryLimits {
+            hub_vote_ttl_secs: 5,
+            hub_retention_secs: 3600,
+            ..Default::default()
+        },
+        Arc::new(move || now.load(Ordering::Relaxed)),
+    );
+    let signal = |node: &str, n: u8| {
+        let mut batch = batch(node, "", [198, 51, 100, n]);
+        batch.signature_signals.push(SignatureSignal {
+            method: "GET".into(),
+            path_prefix: format!("/exploit/{n}"),
+            threat: 3,
+            confidence: 0.99,
+        });
+        batch
+    };
+    hub.ingest_batch(signal("a", 1));
+    hub.ingest_batch(signal("b", 1));
+    hub.ingest_batch(signal("a", 2));
+    clock.store(106, Ordering::Relaxed);
+    assert_eq!(hub.pending_counts(), (0, 0, 0, 0));
+    assert_eq!(hub.retained_counts(), (1, 1, 2));
+    hub.ingest_batch(signal("b", 2));
+    assert_eq!(
+        hub.pull_since(0).ip_deltas.len(),
+        1,
+        "expired votes cannot contribute to quorum"
+    );
+    hub.ingest_batch(signal("a", 2));
+    assert_eq!(hub.retained_counts(), (2, 2, 4));
+}
+
+#[test]
+fn reporter_identity_churn_keeps_vote_accounting_bounded_without_evicting_promotions() {
+    use custos::limits::MemoryLimits;
+    let clock = Arc::new(AtomicI64::new(100));
+    let now = clock.clone();
+    let hub = HubEngine::with_limits_and_clock(
+        64,
+        MemoryLimits {
+            hub_max_entries: 8,
+            hub_max_pending_entries: 4,
+            hub_vote_ttl_secs: 2,
+            ..Default::default()
+        },
+        Arc::new(move || now.load(Ordering::Relaxed)),
+    );
+    for n in 0..10_000 {
+        hub.ingest_batch(batch(
+            &format!("node-{n}"),
+            "",
+            [198, 51, 100, (n % 8 + 1) as u8],
+        ));
+        let (ips, _, reporters, _) = hub.pending_counts();
+        assert!(ips <= 4 && reporters <= 4 * 64);
+    }
+    clock.store(103, Ordering::Relaxed);
+    assert_eq!(hub.pending_counts(), (0, 0, 0, 0));
+    assert_eq!(hub.retained_counts(), (8, 0, 8));
+}
+
 #[tokio::test]
 async fn hub_requires_credentials_and_prevents_forged_quorum() {
     let engine = Arc::new(HubEngine::new(2));

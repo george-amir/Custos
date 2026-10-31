@@ -13,7 +13,8 @@ use std::net::{IpAddr, SocketAddr};
 /// 1. Uses the socket peer, accepting forwarded identity only from configured proxies.
 /// 2. Checks `DecisionStore::check_ip` in sub-microsecond time and short-circuits with `403 Forbidden`
 ///    (plus `x-custos-threat` header) if the IP is actively banned.
-/// 3. Executes the downstream handler, then feeds the resulting `AccessLogEvent` asynchronously
+/// 3. Rejects validated cached signatures before the handler, including at ledger capacity.
+/// 4. Executes the downstream handler, then feeds the resulting `AccessLogEvent` asynchronously
 ///    into `SecurityPipeline::process_event`.
 pub async fn custos_bouncer_middleware(
     State(pipeline): State<SecurityPipeline>,
@@ -44,6 +45,20 @@ pub async fn custos_bouncer_middleware(
             resp.headers_mut().insert("x-custos-threat", val);
         }
         return resp;
+    }
+
+    if let Some(threat) = pipeline
+        .window
+        .cached_signature(req.method().as_str(), req.uri().path())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "ip": client_ip, "action": "block", "threat_class": threat,
+                "reason": "Matched cached Jev signature",
+            })),
+        )
+            .into_response();
     }
 
     let method = req.method().as_str().to_string();

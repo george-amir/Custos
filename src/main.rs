@@ -541,30 +541,26 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
         cfg.memory.max_provider_response_bytes,
     )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline = SecurityPipeline::new_with_limits(
+    let mut pipeline = SecurityPipeline::new_with_limits(
         store.clone(),
         window.clone(),
         jev.clone(),
         firewall.clone(),
         cfg.memory.clone(),
     )?;
+    pipeline.on_decision_capacity = cfg.daemon.on_decision_capacity;
 
-    // Startup initialization already reconciles durable decisions. Retry failures later.
+    // The pipeline worker reconciles enforcement; compact the durable journal separately.
     let sweep_pipeline = pipeline.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
             let p = sweep_pipeline.clone();
-            match tokio::task::spawn_blocking(move || {
-                p.reconcile_firewall()?;
-                p.store.compact_persistence_file()
-            })
-            .await
-            {
+            match tokio::task::spawn_blocking(move || p.store.compact_persistence_file()).await {
                 Ok(Ok(())) => {}
                 other => {
-                    error!(result = ?other, "Firewall reconciliation or compaction failed; will retry")
+                    error!(result = ?other, "Decision journal compaction failed; will retry")
                 }
             }
         }
@@ -726,7 +722,18 @@ async fn run_replay(
         firewall.is_dry_run()
     );
 
-    let verdicts = pipeline.flush_and_analyze(true).await?;
+    let mut verdicts = Vec::new();
+    loop {
+        verdicts.extend(pipeline.flush_and_analyze(true).await?);
+        if pipeline
+            .analysis_metrics
+            .pending_actors
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            break;
+        }
+    }
 
     if cfg.hub.enabled && !verdicts.is_empty() {
         let ack = push_verdicts_via_grpc(

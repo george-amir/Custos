@@ -19,6 +19,15 @@ pub struct MemoryLimits {
     pub max_signatures: usize,
     pub hub_retention_secs: u64,
     pub hub_max_streams: usize,
+    pub max_pending_actors: usize,
+    pub max_pending_bytes: usize,
+    pub analysis_ttl_secs: u64,
+    pub analysis_retry_secs: u64,
+    pub analysis_batches_per_flush: usize,
+    pub hub_max_pending_entries: usize,
+    pub hub_max_pending_signatures: usize,
+    pub hub_max_pending_per_node: usize,
+    pub hub_vote_ttl_secs: u64,
 }
 impl Default for MemoryLimits {
     fn default() -> Self {
@@ -31,6 +40,15 @@ impl Default for MemoryLimits {
             max_signatures: 1024,
             hub_retention_secs: 3600,
             hub_max_streams: 16,
+            max_pending_actors: 4096,
+            max_pending_bytes: 16 * 1024 * 1024,
+            analysis_ttl_secs: 300,
+            analysis_retry_secs: 1,
+            analysis_batches_per_flush: 16,
+            hub_max_pending_entries: 2500,
+            hub_max_pending_signatures: 256,
+            hub_max_pending_per_node: 1000,
+            hub_vote_ttl_secs: 60,
         }
     }
 }
@@ -43,8 +61,21 @@ impl MemoryLimits {
                 && self.max_signatures > 0
                 && self.max_provider_response_bytes > 0
                 && self.hub_max_streams > 0
-                && self.hub_retention_secs > 0,
+                && self.hub_retention_secs > 0
+                && self.max_pending_actors > 0
+                && self.max_pending_bytes > 0
+                && self.analysis_ttl_secs > 0
+                && self.analysis_retry_secs > 0
+                && self.analysis_batches_per_flush > 0
+                && self.hub_max_pending_entries > 0
+                && self.hub_max_pending_signatures > 0
+                && self.hub_max_pending_per_node > 0
+                && self.hub_vote_ttl_secs > 0,
             "Memory limits must be positive"
+        );
+        anyhow::ensure!(
+            self.analysis_ttl_secs <= 86400,
+            "analysis_ttl_secs must be at most 86400"
         );
         anyhow::ensure!(
             (EVENT_RESERVATION_BYTES..=u32::MAX as usize).contains(&self.event_queue_bytes),
