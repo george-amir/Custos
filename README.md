@@ -60,6 +60,15 @@ Sustained validation on macOS (development build, isolated workers):
 
 The site profile also passed all 4,288 existing-ban checks and 4,288 signature checks, preserved 32 active bans and 32 failed cleanup obligations across journal reopening, and reclaimed only confirmed cleanup after recovery. These profiles use simulated firewall execution and provider failure; they measure retained-state behavior, not native firewall throughput or a universal host memory ceiling.
 
+Native Linux validation also passed against real nftables and ipset on OrbStack 2.2.5 / Linux 7.2.12. Per backend, 256 expired IPv4/IPv6 entries were cleaned with two unban processes, all 25 healthy checks were allowed at ledger capacity, and an active ban survived restart. Run the repeatable check after building the image:
+
+```sh
+docker build -t custos:ci .
+python3 .github/scripts/docker-capacity-smoke.py
+```
+
+**Host kernel prerequisite:** live nftables uses the host/VM kernel. Testing on the older OrbStack 1.9.2 / Linux 6.12.5 ARM64 runtime reproduced an alignment fault in `nft_rhash_gc`, consistent with [CVE-2024-54031](https://security-tracker.debian.org/tracker/CVE-2024-54031). Update to a vendor kernel containing the fix before live timeout testing or enforcement; rebuilding the container does not update that kernel. The native test refuses the known crashing OrbStack kernel release. The same validation passed after the runtime moved to Linux 7.2.12.
+
 ## v0.3.0: Memory Limits and Screening Hardening
 
 [Download v0.3.0](https://github.com/george-amir/Custos/releases/tag/v0.3.0) for Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), or Windows (x86_64).

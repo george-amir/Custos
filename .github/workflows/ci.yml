@@ -51,3 +51,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t custos:ci .
       - run: ./.github/scripts/docker-smoke.sh
+      - name: Verify native expiry, batch cleanup, and availability at saturation
+        run: python3 .github/scripts/docker-capacity-smoke.py
