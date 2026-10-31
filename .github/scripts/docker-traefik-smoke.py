@@ -28,26 +28,30 @@ decisions_file = "/tmp/traefik-decisions.jsonl"
 [firewall]
 enabled = false
 ''')
-        # Traefik v2 attaches access logging to routers, so use an unavailable
-        # local backend to obtain a logged proxy-generated response.
+        # Attach logging to an explicit router on all builds. An IP policy denies
+        # the controlled probes before any backend is contacted (OriginStatus=0).
         legacy = ":v2." in image
-        expected_status = 502 if legacy else 404
-        provider = []
-        if legacy:
-            tmp.joinpath("routes.yml").write_text('''
+        expected_status = 403
+        policy = "ipWhiteList" if legacy else "ipAllowList"
+        tmp.joinpath("routes.yml").write_text('''
 http:
   routers:
     probes:
       rule: "PathPrefix(`/`)"
       entryPoints: [web]
+      middlewares: [deny]
       service: unavailable
+  middlewares:
+    deny:
+      POLICY:
+        sourceRange: ["192.0.2.1/32"]
   services:
     unavailable:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:1"
-''')
-            provider = ["--providers.file.filename=/logs/routes.yml"]
+'''.replace("POLICY", policy))
+        provider = ["--providers.file.filename=/logs/routes.yml"]
         try:
             docker("run", "-d", "--name", name, "-p", "127.0.0.1::8000",
                    "-v", f"{directory}:/logs", image,
@@ -97,8 +101,7 @@ http:
                 time.sleep(0.1)
             assert len(records) == 5
             assert all(r["DownstreamStatus"] == expected_status for r in records)
-            if not legacy:
-                assert all(r.get("OriginStatus", 0) == 0 for r in records)
+            assert all(r.get("OriginStatus", 0) == 0 for r in records)
             tmp.joinpath("replay.jsonl").write_text("\n".join(selected) + "\n")
             replay = docker("run", "--rm", "--network", "none", "-v", f"{directory}:/test:ro",
                             "custos:ci", "--config", "/test/config.toml", "replay",
@@ -111,6 +114,8 @@ http:
         except Exception:
             logs = docker("logs", "--tail", "20", name, check=False)
             print(logs.stdout, logs.stderr)
+            if tmp.joinpath("access.log").exists():
+                print("Generated test log:", tmp.joinpath("access.log").read_text()[-4096:])
             raise
         finally:
             docker("rm", "-fv", name, check=False)
