@@ -10,6 +10,8 @@ fn cli_replay_drains_more_than_one_analysis_work_budget() {
     cfg.daemon.decisions_file = ledger.clone();
     cfg.firewall.enabled = false;
     cfg.jev.max_actors_per_batch = 1;
+    cfg.window.auth_paths = vec!["/api/v1/auth/login".into()];
+    cfg.window.auth_failure_threshold = 5;
     cfg.memory.analysis_batches_per_flush = 1;
     custos::service::write_secret_file(&config, toml::to_string(&cfg).unwrap().as_bytes()).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_custos"))

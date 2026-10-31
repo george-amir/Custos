@@ -87,6 +87,7 @@ impl CustosBuilder {
 
     pub fn build(self) -> Result<SecurityPipeline> {
         self.config.memory.validate()?;
+        self.config.window.validate()?;
         let limits = self.config.memory;
         let use_mock = self.mock_jev || self.config.jev.api_key.trim().is_empty();
         let store = Arc::new(DecisionStore::open_with_limit(
@@ -113,7 +114,7 @@ impl CustosBuilder {
 
 /// Coordinates the 3-stage pipeline:
 /// 1. Ingests `AccessLogEvent` through `SlidingWindowEngine` (skipping already-banned IPs and benign static hits).
-/// 2. Records instant L1 bans (volumetric floods or cached Jev signatures) and enforces OS firewall rules.
+/// 2. Applies short HTTP-only volume throttles; records cached-signature or explicitly opted-in strict L1 bans.
 /// 3. Flushes suspicious IP windows in batches to `JevBatchAnalyzer` (`/v1/systemone`),
 ///    updating `DecisionStore`, enforcing OS firewall rules, and caching high-confidence attack signatures.
 enum IngestionMessage {
@@ -432,7 +433,9 @@ impl SecurityPipeline {
             return Ok(());
         }
         match self.window.ingest_bounded(ev, oversized) {
-            L1Disposition::IgnoredStatic | L1Disposition::Buffered { .. } => {}
+            L1Disposition::IgnoredStatic
+            | L1Disposition::Buffered { .. }
+            | L1Disposition::Throttled { .. } => {}
             L1Disposition::CapacityExceeded => anyhow::bail!("IP window capacity reached"),
             L1Disposition::InstantBan {
                 threat_class,

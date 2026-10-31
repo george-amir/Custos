@@ -109,7 +109,7 @@ fn static_requests_count_toward_flood_limits() {
     }
     assert!(matches!(
         w.ingest(&event("/image.webp")),
-        L1Disposition::InstantBan { .. }
+        L1Disposition::Throttled { .. }
     ));
 }
 
@@ -313,6 +313,10 @@ fn ordinary_encoded_routes_and_static_assets_do_not_require_analysis() {
 fn percent_encoding_density_is_retained_as_a_signal_after_decoding() {
     let w = SlidingWindowEngine::new(WindowConfig::default());
     w.ingest(&event("/search?q=%61%62%63%64"));
+    // Encoding density is retained as context but cannot promote a window alone.
+    assert!(w.drain_suspicious_summaries(true).is_empty());
+    w.ingest(&event("/search?q=%61%62%63%64"));
+    w.ingest(&event("/.env"));
     let summaries = w.drain_suspicious_summaries(true);
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].max_special_chars_in_uri, 4);

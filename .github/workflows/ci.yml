@@ -53,3 +53,5 @@ jobs:
       - run: ./.github/scripts/docker-smoke.sh
       - name: Verify native expiry, batch cleanup, and availability at saturation
         run: python3 .github/scripts/docker-capacity-smoke.py
+      - name: Verify Nginx allows, throttles, bans, and forwards original methods
+        run: python3 .github/scripts/docker-proxy-smoke.py

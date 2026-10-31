@@ -38,7 +38,31 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 ---
 
-## Unreleased: Availability at saturation
+## v0.4.0: False-positive safeguards and availability at saturation
+
+[Download v0.4.0](https://github.com/george-amir/Custos/releases/tag/v0.4.0) for Linux, macOS, or Windows.
+
+New convictions require deterministic HTTP evidence in addition to the model's probability. Generic resource `401/403` responses, server `5xx` errors, URI punctuation, and request volume cannot independently create Jev IP bans. This rule applies to live and mock analysis; existing, manual, and authenticated Hub bans retain their enforcement behavior.
+
+The five client-traffic cases are handled as follows:
+
+| Case | v0.4.0 behavior |
+| :--- | :--- |
+| Parallel API calls during token refresh | Resource `401/403` responses remain context; no status-only ban or AI call |
+| Repeated requests to one broken URL | Counts distinct paths that actually returned `404`; healthy routes cannot inflate probe diversity |
+| Client retry loop / many assets | Default five-second HTTP `429` with `Retry-After`, with no durable/kernel ban or Hub report |
+| Several users behind the same public IP | Generic errors cannot combine into a credential ban; shared volume can still briefly throttle that IP |
+| Backend errors / encoded JSON query filters | Status and punctuation alone do not promote windows to Jev or authorize a ban |
+
+Credential-failure detection is opt-in through `window.auth_paths`, an exact list of POST login endpoints. The default list is empty. With paths configured, the default threshold is ten failed requests in one window; a successful configured auth request in that collected window suppresses the auth conviction. Endpoint enumeration requires at least five `404`s across four distinct missing paths. Samples now include observed repeat counts such as `[x5]`; sample and path-cardinality storage remain bounded.
+
+**Upgrade:** existing configuration files receive the safer defaults. Set `window.flood_action = "ban"` only to explicitly restore volume-only IP bans. Review real login endpoints before configuring `auth_paths`; Custos cannot observe credentials, verify which account failed, or separate users sharing a public IP. Use application rate limits based on verified accounts/sessions for that distinction. Unverified User-Agent strings and cookies never create independent rate-limit identities. Update Rust struct literals for the new fields, preferably using `..Default::default()`, and handle `L1Disposition::Throttled`.
+
+HTTP throttles use monotonic time, cannot be extended by read-only checks, and survive analysis drains. Their table is capped at the effective window capacity and included in the conservative reservation. At throttle-table capacity, new throttle identities are omitted until expiry frees room; existing throttles and durable bans remain intact. Use frontend rate/concurrency limits for high-cardinality traffic. Log-driven detection follows completed requests, so in-flight requests can pass before the first throttle is recorded; this is not a synchronous admission-rate guarantee.
+
+Validation: 145 Rust tests pass, including all five client scenarios, a local HTTP provider returning maximum-confidence malicious answers for context-only evidence, cooldown expiry, strict-policy opt-in, and bounded missing-path storage. Formatting, Clippy, and Rust 1.88 checks pass. Docker tests exercise the actual Nginx example: healthy requests receive `200`, temporary throttles receive `429` with `Retry-After`, durable bans remain `403`, and original POST signatures survive Nginx's GET auth subrequest.
+
+### Availability at saturation
 
 A full decision ledger now defaults to `daemon.on_decision_capacity = "enforce_existing"`: existing bans and validated cached signatures still reject requests, while unbanned clients remain eligible for admission. New durable bans are refused until cleanup frees slots. Set `"fail_closed"` to retain v0.3.0's strict HTTP 503 policy. Ingestion and HTTP concurrency limits remain independent and can still return overload errors.
 
@@ -54,17 +78,18 @@ Sustained validation on macOS (development build, isolated workers):
 
 | Profile | Duration | Attack events | Healthy checks allowed | Peak RSS |
 | :--- | ---: | ---: | ---: | ---: |
-| Full ledger + failed cleanup + provider outage | 60.1 s | 130,879 | 4,288 / 4,288 | 15.3 MiB |
-| Memory saturation, small limits | 60.9 s | 442,000 | — | 18.3 MiB |
-| Memory saturation, default limits | 82.1 s | 24,000 | — | 30.1 MiB |
+| Full ledger + failed cleanup + provider outage | 60.1 s | 434,183 | 3,850 / 3,850 | 15.3 MiB |
+| Memory saturation, small limits | 60.2 s | 426,000 | — | 16.8 MiB |
+| Memory saturation, default limits | 151.2 s | 24,000 | — | 26.4 MiB |
 
-The site profile also passed all 4,288 existing-ban checks and 4,288 signature checks, preserved 32 active bans and 32 failed cleanup obligations across journal reopening, and reclaimed only confirmed cleanup after recovery. These profiles use simulated firewall execution and provider failure; they measure retained-state behavior, not native firewall throughput or a universal host memory ceiling.
+The site profile also passed all 3,850 existing-ban checks and 3,850 signature checks, preserved 32 active bans and 32 failed cleanup obligations across journal reopening, and reclaimed only confirmed cleanup after recovery. Memory profiles also churn a separate HTTP throttle table capped at 120 entries. These profiles use simulated firewall execution and provider failure; they measure retained-state behavior, not native firewall throughput or a universal host memory ceiling. Timings include concurrent local build activity.
 
 Native Linux validation also passed against real nftables and ipset on OrbStack 2.2.5 / Linux 7.2.12. Per backend, 256 expired IPv4/IPv6 entries were cleaned with two unban processes, all 25 healthy checks were allowed at ledger capacity, and an active ban survived restart. Run the repeatable check after building the image:
 
 ```sh
 docker build -t custos:ci .
 python3 .github/scripts/docker-capacity-smoke.py
+python3 .github/scripts/docker-proxy-smoke.py
 ```
 
 **Host kernel prerequisite:** live nftables uses the host/VM kernel. Testing on the older OrbStack 1.9.2 / Linux 6.12.5 ARM64 runtime reproduced an alignment fault in `nft_rhash_gc`, consistent with [CVE-2024-54031](https://security-tracker.debian.org/tracker/CVE-2024-54031). Update to a vendor kernel containing the fix before live timeout testing or enforcement; rebuilding the container does not update that kernel. The native test refuses the known crashing OrbStack kernel release. The same validation passed after the runtime moved to Linux 7.2.12.
@@ -80,7 +105,7 @@ Validation includes 95 passing tests and isolated sustained-load runs: 612,000 s
 ### Upgrading from v0.2.x
 
 - **Configuration:** existing TOML files receive defaults for the new `[memory]` section. Review `config.example.toml`; the 64 MiB window reservation budget is separate from queue, ban, and Hub limits and is not a process RSS ceiling.
-- **Overload in v0.3.0:** existing bans and cleanup obligations are preserved; unknown clients receive HTTP 503 at decision capacity. The unreleased changes above introduce the configurable availability policy. Include static assets when sizing the flood threshold.
+- **Overload in v0.3.0:** existing bans and cleanup obligations are preserved; unknown clients receive HTTP 503 at decision capacity. v0.4.0 introduces the configurable availability policy above. Include static assets when sizing the flood threshold.
 - **Persistence:** the journal must fit the configured decision capacity; reasons are limited to 512 bytes, threat names to 64 bytes, and journal records to 4 KiB. Startup rejects incompatible records explicitly. Preserve cleanup obligations when migrating or changing limits.
 - **Embedded Rust applications:** update explicit `AppConfig`/`WindowConfig` struct literals for the new fields or use `..Default::default()`. Handle overload errors from `submit_event`; use `spawn_pipeline_tailer` for byte-budgeted file ingestion or `visit_log_file` for streaming replay. The bulk `replay_log_file` helper collects caller-owned events.
 - **Hub deployments:** upgrade Hub and nodes together to use capacity acknowledgements and retries. The wire protocol adds `PushAck.rejected_capacity` and `rejected_invalid`; requests are limited to 256 signals and 256 KiB. Vote/signature retention, per-entry voter limits, and subscription limits now apply.
@@ -100,7 +125,7 @@ flowchart LR
 
     subgraph L1["Tier 1: Zero-Token L1 Filter & Windowing"]
         Static["Ignore Benign Static Assets"]
-        Flood["Instant L1 Ban\n(Volumetric Floods & Cached Signatures)"]
+        Flood["Short HTTP Throttle for Volume\nInstant Ban for Cached Signatures"]
         Cap["Bounded Sliding IP Windows\n(max_tracked_ips = 50,000)"]
         Sanitize["Adversarial Log Sanitizer\n(Prompt-Injection Strip)"]
     end
@@ -130,7 +155,7 @@ flowchart LR
 
 ### How the 3-Tier Pipeline Achieves Ultra-Low Cost
 1. **Benign static traffic is filtered at Tier 1 for $0**: Successful `GET`/`HEAD` static asset requests with no suspicious URI or User-Agent signals skip AI analysis, while still counting toward L1 flood limits. Set the flood threshold for total page traffic, including assets. Cached exploit signatures are checked before this shortcut.
-2. **Multi-Actor Compacted State Batching**: Only suspicious IP behavioral windows (e.g., `401/403` brute-force bursts, `404` path-enumeration spikes, SQLi/XSS/LFI probe tokens, or scanner User-Agents) are promoted to Tier 2. Custos packs up to **25 suspicious actors into a single `/v1/systemone` request** (~$0.00009 per 4-actor batch).
+2. **Multi-Actor Compacted State Batching**: Suspicious IP windows containing configured login failures without recovery, diverse missing-path probes, SQLi/XSS/LFI tokens, or scanner signals are promoted to Tier 2. Generic errors and punctuation alone stay out of analysis. Custos packs up to **25 suspicious actors into a single `/v1/systemone` request** (~$0.00009 per 4-actor batch).
 3. **Conservative L1 Signature Learning**: High-confidence actor verdicts can cache exact known exploit targets such as `/.env` and `/.git/config`. Ordinary application routes, first samples without exploit evidence, and query-specific attacks never become route-wide signatures. Cached matches avoid additional AI calls.
 
 Window expiration runs during ingestion even while Jev is unavailable. Failed analysis batches remain available for retry; expired suspicious windows use a bounded backlog. If that backlog fills, the oldest expired evidence is dropped and counted in `custos_expired_evidence_dropped_total`.
@@ -175,7 +200,7 @@ curl -fsSL https://raw.githubusercontent.com/george-amir/Custos/main/install.sh 
 
 #### Or Install Directly via Cargo (No `protoc` Required)
 ```bash
-cargo install --git https://github.com/george-amir/Custos.git --tag v0.3.0 --locked
+cargo install --git https://github.com/george-amir/Custos.git --tag v0.4.0 --locked
 ```
 
 ### 2. Zero-Config Setup & Run (`custos init`)
@@ -371,30 +396,44 @@ Even when OS firewall mode is disabled or running in `dry_run = true`, any rever
 
 - Returns **`200 OK`** (`{"action": "allow"}`) for benign IPs.
 - Returns **`403 Forbidden`** (`{"action": "block", "threat_class": "..."}`) with header `X-Custos-Threat: <threat_class>` for banned IPs.
+- Returns **`429 Too Many Requests`** (`{"action": "throttle"}`), `Retry-After`, and `X-Custos-Action: throttle` for temporary volume limits. Checks do not extend the cooldown.
 
 To reject cached signatures through the standalone checker, the proxy must overwrite both `X-Original-Method` and `X-Original-URI` with the protected request's values. Missing both preserves IP-only checks; incomplete/invalid metadata returns `400`. Trusted headers take precedence over optional `method`/`uri` query parameters. Keep this API reachable only by trusted proxies. The examples below follow [Nginx auth subrequests](https://nginx.org/en/docs/http/ngx_http_auth_request_module.html) and [Caddy's original-request forwarding](https://caddyserver.com/docs/caddyfile/directives/forward_auth).
 
 ### Nginx (`ngx_http_auth_request_module`)
+
+Nginx auth subrequests accept only `2xx`, `401`, or `403`. Use `auth_request=true` so Custos represents a temporary throttle as `403` with an action header; the configuration below maps only that action back to client-facing `429`. Existing bans remain `403`.
+
 ```nginx
 server {
     listen 80;
     server_name example.com;
 
-    # Sub-millisecond Custos Bouncer check before proxying
-    auth_request /_custos_check;
+    auth_request_set $custos_action $upstream_http_x_custos_action;
+    auth_request_set $custos_retry_after $upstream_http_retry_after;
+    error_page 403 = @custos_denied;
+
+    location @custos_denied {
+        add_header Retry-After $custos_retry_after always;
+        if ($custos_action = throttle) { return 429; }
+        return 403;
+    }
 
     location = /_custos_check {
         internal;
-        proxy_pass http://127.0.0.1:8085/v1/bouncer/check?ip=$remote_addr;
+        proxy_pass http://127.0.0.1:8085/v1/bouncer/check?auth_request=true&ip=$remote_addr;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Original-Method $custos_original_method;
         proxy_set_header X-Original-URI $request_uri;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
     location / {
+        # Capture the parent method before Nginx creates its GET auth subrequest.
+        set $custos_original_method $request_method;
+        auth_request /_custos_check;
         proxy_pass http://127.0.0.1:3000;
     }
 }
@@ -467,7 +506,7 @@ Because `custos` vendors its generated Protobuf/gRPC code in [`src/hub_proto.rs`
 ### Add to `Cargo.toml`
 ```toml
 [dependencies]
-custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.3.0" }
+custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.4.0" }
 ```
 
 ### Embed `custos_bouncer_middleware` in an Axum Router
@@ -541,7 +580,9 @@ Scrape `http://127.0.0.1:8085/metrics` with Prometheus, Grafana Agent, or Vector
 | `custos_static_ignored_total` | `counter` | Static hits skipped for AI analysis while counting toward flood limits |
 | `custos_capacity_dropped_total` | `counter` | Events rejected because active window capacity was reached |
 | `custos_expired_evidence_dropped_total` | `counter` | Oldest expired windows dropped when the evidence backlog filled |
-| `custos_l1_instant_bans_total` | `counter` | Instant bans triggered by L1 flood or cached validated exploit signatures |
+| `custos_l1_instant_bans_total` | `counter` | Cached-signature bans or explicitly opted-in strict volume bans |
+| `custos_http_throttles_total` / `custos_http_throttles_retained` | `counter` / `gauge` | Short HTTP-only limits created / bounded retained entries, including entries awaiting an expiry sweep |
+| `custos_jev_evidence_rejected_total` | `counter` | Model convictions rejected because deterministic evidence did not support the class |
 | `custos_windows_promoted_total` | `counter` | Suspicious IP windows promoted to TypeSafe Jev Tier 2 |
 | `custos_jev_batches_total` | `counter` | Total multi-actor batch requests sent to Jev `/v1/systemone` |
 | `custos_jev_actors_evaluated_total` | `counter` | Total suspicious actors evaluated by Jev |
@@ -579,7 +620,11 @@ See [`config.example.toml`](config.example.toml) for a complete annotated config
 | `firewall.table_name` | `"custos_block"` | — | Kernel table/set name for `pf`, `nftables`, and `ipset` |
 | `window.window_secs` | `15` | — | Sliding behavioral window duration per IP |
 | `window.flush_interval_ms` | `2500` | — | Interval between multi-actor Jev batch evaluations |
-| `window.l1_flood_threshold` | `120` | — | Instant L1 ban threshold (requests per window) |
+| `window.l1_flood_threshold` | `120` | — | Total requests per IP window before a volume action, including static assets |
+| `window.flood_action` | `"throttle"` | — | Short HTTP-only throttle; `"ban"` opts into volume-only durable IP bans |
+| `window.throttle_secs` | `5` | — | HTTP cooldown, 1–60 seconds |
+| `window.auth_paths` | `[]` | — | Exact POST login paths eligible for credential-failure evidence; empty disables status-only auth bans |
+| `window.auth_failure_threshold` | `10` | — | Failed configured auth requests required, minimum 3; success suppresses auth conviction for that collected window |
 | `window.max_tracked_ips` | `50000` | — | Upper bound on active IP windows, also limited by the state reservation budget |
 | `window.max_state_bytes` | `67108864` | — | Conservative reservation budget for active and expired window evidence (64 MiB) |
 | `memory.max_decisions` | `10000` | — | Combined retained ban and cleanup slots |

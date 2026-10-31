@@ -1,4 +1,4 @@
-# Custos v0.1 Example Configuration
+# Custos v0.4 Example Configuration
 
 [daemon]
 bouncer_listen = "127.0.0.1:8085"
@@ -24,9 +24,18 @@ format = "nginx_combined"
 window_secs = 15
 # Flush check interval in milliseconds
 flush_interval_ms = 2500
-# L1 instant-ban volumetric flood threshold within a single window
+# Total requests per IP window, including assets. Default action is a short HTTP throttle.
 l1_flood_threshold = 120
-# Minimum requests or suspicion score required to promote an IP window to Jev L2 analysis
+# "ban" explicitly restores the old volume-only durable/kernel ban behavior.
+flood_action = "throttle"
+# Short monotonic HTTP-only cooldown; valid range 1..60 seconds. Never sent to the Hub.
+throttle_secs = 5
+# Exact POST authentication paths. Empty disables status-only credential-stuffing bans.
+# Configure only real login routes; resource 401/403 errors never count as login failures.
+auth_paths = []
+# Minimum 3; default 10. A successful configured auth request suppresses this window's auth conviction.
+auth_failure_threshold = 10
+# Minimum suspicion score required to promote an IP window to Jev L2 analysis
 min_suspicion_score = 2
 # Maximum sample requests retained per IP window for Jev state compaction
 max_sample_requests = 10

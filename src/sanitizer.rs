@@ -194,6 +194,12 @@ pub struct ActorStateSummary {
     pub total_requests: usize,
     pub req_per_sec: f64,
     pub unique_paths: usize,
+    #[serde(default)]
+    pub unique_404_paths: usize,
+    #[serde(default)]
+    pub auth_failures: usize,
+    #[serde(default)]
+    pub auth_successes: usize,
     pub status_2xx: usize,
     pub status_3xx: usize,
     pub status_401_403: usize,
@@ -208,16 +214,42 @@ pub struct ActorStateSummary {
 }
 
 impl ActorStateSummary {
+    /// A model's probability cannot manufacture missing HTTP evidence.
+    pub fn permits_ip_ban(&self, threat: &str) -> bool {
+        let signal = |name: &str| self.l1_suspicion_reasons.iter().any(|r| r == name);
+        let injection = signal("sqli_or_xss_token_pattern") || self.prompt_injection_flag;
+        let traversal = signal("path_traversal_pattern");
+        let scanner = signal("offensive_scanner_ua") || signal("intrinsic_exploit_path");
+        let enumeration = self.status_404 >= 5 && self.unique_404_paths >= 4;
+        match threat {
+            "credential_stuffing" => {
+                signal("repeated_auth_failures")
+                    && self.auth_failures >= 3
+                    && self.auth_successes == 0
+            }
+            "sqli_or_injection" => injection,
+            "path_traversal_lfi" => traversal,
+            "vulnerability_scanner" | "api_enumeration_idor" => {
+                injection || traversal || scanner || enumeration
+            }
+            "layer7_dos" => injection || traversal || scanner,
+            _ => false,
+        }
+    }
+
     /// Formats the actor window into a dense, single-line tabular record to eliminate
     /// repeated JSON field name overhead across multi-actor batches.
     pub fn to_compact_line(&self) -> String {
         format!(
-            "{} | ip={} | reqs={} ({}/s, uniq={}) | codes=[2xx:{},401/403:{},404:{},5xx:{},err_ratio:{}] | spec_chars={} | prompt_inj={} | signals=[{}] | ua=[{}] | samples=[{}]",
+            "{} | ip={} | reqs={} ({}/s, uniq={},uniq_404={}) | auth=[fail:{},success:{}] | codes=[2xx:{},401/403:{},404:{},5xx:{},err_ratio:{}] | spec_chars={} | prompt_inj={} | signals=[{}] | ua=[{}] | samples=[{}]",
             self.actor_key,
             self.client_ip,
             self.total_requests,
             self.req_per_sec,
             self.unique_paths,
+            self.unique_404_paths,
+            self.auth_failures,
+            self.auth_successes,
             self.status_2xx,
             self.status_401_403,
             self.status_404,

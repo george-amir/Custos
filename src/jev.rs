@@ -89,6 +89,7 @@ pub struct ActorVerdict {
 
 #[derive(Debug, Default)]
 pub struct JevClientMetrics {
+    pub evidence_rejected: AtomicU64,
     pub batches_evaluated: AtomicU64,
     pub actors_evaluated: AtomicU64,
     pub input_tokens_total: AtomicU64,
@@ -196,7 +197,7 @@ impl JevBatchAnalyzer {
         let mut noul_criteria = BTreeMap::new();
         noul_criteria.insert(
             "true".to_string(),
-            "Malicious scanning, injection, traversal, or >=3 auth 401/403 failures; block IP"
+            "Corroborated exploit/scanner evidence, diverse 404 probes, or repeated failures on configured POST authentication routes without auth recovery; block IP. Generic 401/403, retries, 5xx, punctuation, and volume alone are not ban evidence."
                 .to_string(),
         );
         noul_criteria.insert(
@@ -371,9 +372,15 @@ impl JevBatchAnalyzer {
             // `choice` probability between two malicious classes (confidence ~ 0.50).
             // Therefore, `should_ban` is gated by `noul_ban_threshold` (or high-confidence non-benign choice),
             // while `choice_confidence` gates auto-signature caching.
-            let should_ban = threat_class != "benign_traffic"
+            let model_ban = threat_class != "benign_traffic"
                 && (noul_prob >= self.cfg.noul_ban_threshold
                     || (noul_prob >= 0.70 && choice_confidence >= 0.95));
+            let should_ban = model_ban && actor.permits_ip_ban(&threat_class);
+            if model_ban && !should_ban {
+                self.metrics
+                    .evidence_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             let recommend_auto_signature = should_ban
                 && choice_confidence >= self.cfg.auto_signature_confidence_threshold
@@ -412,28 +419,22 @@ impl JevBatchAnalyzer {
 
         for actor in chunk {
             let reasons = &actor.l1_suspicion_reasons;
-            let samples_joined = actor.sample_requests.join(" ").to_ascii_lowercase();
 
             let (choice, noul, confidence) = if actor.prompt_injection_flag {
                 ("sqli_or_injection", 0.98, 0.95)
             } else if reasons.iter().any(|r| r == "sqli_or_xss_token_pattern") {
                 ("sqli_or_injection", 0.97, 0.94)
-            } else if samples_joined.contains("../")
-                || samples_joined.contains("/etc/passwd")
-                || samples_joined.contains("..%2f")
-            {
+            } else if reasons.iter().any(|r| r == "path_traversal_pattern") {
                 ("path_traversal_lfi", 0.96, 0.94)
             } else if reasons.iter().any(|r| r == "offensive_scanner_ua")
-                || reasons
-                    .iter()
-                    .any(|r| r == "sensitive_or_exploit_path_probe")
+                || reasons.iter().any(|r| r == "intrinsic_exploit_path")
             {
                 ("vulnerability_scanner", 0.94, 0.93)
             } else if reasons.iter().any(|r| r == "repeated_auth_failures")
-                && actor.status_401_403 >= 3
+                && actor.auth_successes == 0
             {
                 ("credential_stuffing", 0.91, 0.89)
-            } else if actor.status_404 >= 5 && actor.unique_paths >= 4 {
+            } else if actor.status_404 >= 5 && actor.unique_404_paths >= 4 {
                 ("api_enumeration_idor", 0.85, 0.82)
             } else {
                 ("benign_traffic", 0.12, 0.88)
@@ -479,7 +480,7 @@ pub fn standard_threat_criteria() -> BTreeMap<String, String> {
     );
     m.insert(
         "credential_stuffing".to_string(),
-        "Repeated 401/403 login brute-force".to_string(),
+        "Configured POST login failures above the auth threshold without recovery".to_string(),
     );
     m.insert(
         "sqli_or_injection".to_string(),
@@ -491,15 +492,17 @@ pub fn standard_threat_criteria() -> BTreeMap<String, String> {
     );
     m.insert(
         "vulnerability_scanner".to_string(),
-        "Scanner (Nuclei/Nikto) or .env/.git/wp-admin probe".to_string(),
+        "Known scanner tool, intrinsic .env/.git exploit target, or diverse missing-path probes"
+            .to_string(),
     );
     m.insert(
         "api_enumeration_idor".to_string(),
-        "High-404 endpoint or IDOR enumeration".to_string(),
+        "At least five 404s across four distinct missing paths, or explicit exploit evidence"
+            .to_string(),
     );
     m.insert(
         "layer7_dos".to_string(),
-        "Volumetric HTTP request flood".to_string(),
+        "HTTP flood corroborated by exploit/scanner evidence; volume alone requires a short HTTP throttle".to_string(),
     );
     m
 }
@@ -520,6 +523,9 @@ mod tests {
             total_requests: 6,
             req_per_sec: 0.6,
             unique_paths: 5,
+            unique_404_paths: 5,
+            auth_failures: 0,
+            auth_successes: 0,
             status_2xx: 0,
             status_3xx: 0,
             status_401_403: 0,

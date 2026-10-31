@@ -568,6 +568,14 @@ fn ddos_worker() {
         }
     };
     let windows = SlidingWindowEngine::with_limits(window_cfg.clone(), limits.clone());
+    let retries = SlidingWindowEngine::new(WindowConfig {
+        max_tracked_ips: 128,
+        max_state_bytes: 1024 * 1024,
+        max_sample_requests: 0,
+        l1_flood_threshold: 1,
+        throttle_secs: 1,
+        ..Default::default()
+    });
     let clock = Arc::new(AtomicI64::new(1000));
     let clock_fn = clock.clone();
     let hub = HubEngine::with_limits_and_clock(
@@ -646,6 +654,21 @@ fn ddos_worker() {
                 user_agent: "x".repeat(2048),
             };
             windows.ingest(&e);
+            let retry = AccessLogEvent {
+                timestamp: e.timestamp,
+                client_ip: ip,
+                method: "GET".into(),
+                path: "/api/feed".into(),
+                query: String::new(),
+                status: 200,
+                bytes_sent: 0,
+                referer: String::new(),
+                user_agent: format!("rotating-device-{requests}"),
+            };
+            assert!(matches!(
+                retries.ingest(&retry),
+                custos::window::L1Disposition::Throttled { .. }
+            ));
             if requests & 7 == 0 {
                 let _ = runtime.block_on(p.submit_event(e));
             }
@@ -725,6 +748,8 @@ fn ddos_worker() {
             ips <= limits.hub_max_entries && sigs <= limits.max_signatures && history <= ips + sigs
         );
         assert!(windows.active_signature_count() <= limits.max_signatures);
+        assert!(retries.retained_throttle_count() <= retries.max_windows());
+        assert!(retries.drain_suspicious_summaries(true).is_empty());
         let (active, expired) = windows.retained_window_counts();
         assert!(
             active <= if defaults { 50_000 } else { 512 }
@@ -760,6 +785,7 @@ fn ddos_worker() {
         serde_json::json!({"default_limits":defaults,"seconds":start.elapsed().as_secs_f64(),"requests":requests,"waves":wave,
         "rejected_bans":rejected,"steady_heap_max_bytes":steady_heap,"steady_rss_max_bytes":steady_rss,
         "peak_rust_heap_bytes":PEAK.load(Ordering::Relaxed),"warmup":baseline,"retained_bans":store.retained_count(),
-        "hub_retained":hub.retained_counts(),"window_retained":windows.retained_window_counts()})
+        "hub_retained":hub.retained_counts(),"window_retained":windows.retained_window_counts(),
+        "http_throttles_retained":retries.retained_throttle_count(),"http_throttle_limit":retries.max_windows()})
     );
 }

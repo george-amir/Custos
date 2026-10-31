@@ -24,7 +24,11 @@ async fn test_full_pipeline_and_bouncer_api_end_to_end() {
     let decisions_path = dir.path().join("decisions.jsonl");
 
     let store = Arc::new(DecisionStore::open(decisions_path, 3600).unwrap());
-    let window = Arc::new(SlidingWindowEngine::new(WindowConfig::default()));
+    let window = Arc::new(SlidingWindowEngine::new(WindowConfig {
+        auth_paths: vec!["/api/v1/auth/login".into()],
+        auth_failure_threshold: 5,
+        ..Default::default()
+    }));
     let jev = Arc::new(JevBatchAnalyzer::new(JevConfig::default(), true).unwrap());
     let firewall = Arc::new(FirewallBouncer::new(FirewallConfig::default()));
     let pipeline =
@@ -201,6 +205,11 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
     let dir_a = tempdir().unwrap();
     let pipeline_a = SecurityPipeline::builder()
         .with_decisions_file(dir_a.path().join("decisions_a.jsonl"))
+        .with_window_config(WindowConfig {
+            auth_paths: vec!["/api/v1/auth/login".into()],
+            auth_failure_threshold: 5,
+            ..Default::default()
+        })
         .with_mock_jev(true)
         .build()
         .unwrap();

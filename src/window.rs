@@ -1,4 +1,4 @@
-use crate::config::WindowConfig;
+use crate::config::{FloodAction, WindowConfig};
 use crate::sanitizer::{
     ActorStateSummary, MAX_SANITIZED_UA_LEN, MAX_SANITIZED_URI_LEN, decode_url, inspect_untrusted,
     redact_sensitive, sanitize_untrusted,
@@ -7,7 +7,7 @@ use crate::tailer::{AccessLogEvent, MAX_METHOD_BYTES, MAX_UA_BYTES, MAX_URI_BYTE
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use regex::Regex;
-use std::collections::{BTreeSet, HashSet, VecDeque, hash_map::RandomState};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::RandomState};
 use std::hash::BuildHasher;
 use std::net::IpAddr;
 use std::sync::LazyLock;
@@ -50,11 +50,13 @@ const SCANNER_UA_PATTERNS: &[&str] = &[
 /// Outcome of processing a single `AccessLogEvent` through the L1 engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum L1Disposition {
+    /// Short HTTP-only rate limit. Never written to the durable ban ledger or Hub.
+    Throttled { retry_after_secs: u64 },
     /// No additional IP can be admitted without exceeding the configured bound.
     CapacityExceeded,
     /// Benign static asset or healthcheck; skipped to save memory and tokens.
     IgnoredStatic,
-    /// Matched an auto-cached attack signature or volumetric flood threshold at L1.
+    /// Matched an auto-cached attack signature or explicitly opted-in strict flood policy.
     InstantBan {
         threat_class: String,
         reason: String,
@@ -69,7 +71,11 @@ struct IpWindowState {
     last_seen: DateTime<Utc>,
     last_observed: Instant,
     total_requests: usize,
+    rate_checkpoint: usize,
     unique_paths: HashSet<u64>,
+    unique_404_paths: HashSet<u64>,
+    auth_failures: usize,
+    auth_successes: usize,
     status_2xx: usize,
     status_3xx: usize,
     status_401_403: usize,
@@ -80,7 +86,8 @@ struct IpWindowState {
     suspicion_score: u32,
     suspicion_reasons: BTreeSet<String>,
     user_agents: BTreeSet<String>,
-    sample_requests: Vec<(u32, String)>,
+    // Priority, redacted trace, observed repetition count.
+    sample_requests: Vec<(u32, String, usize)>,
 }
 
 impl IpWindowState {
@@ -90,7 +97,11 @@ impl IpWindowState {
             last_seen: now,
             last_observed: Instant::now(),
             total_requests: 0,
+            rate_checkpoint: 0,
             unique_paths: HashSet::new(),
+            unique_404_paths: HashSet::new(),
+            auth_failures: 0,
+            auth_successes: 0,
             status_2xx: 0,
             status_3xx: 0,
             status_401_403: 0,
@@ -109,6 +120,7 @@ impl IpWindowState {
 /// Telemetry counters for L1 filtering and windowing.
 #[derive(Debug, Default)]
 pub struct WindowMetrics {
+    pub http_throttles: AtomicU64,
     pub capacity_dropped: AtomicU64,
     pub expired_evidence_dropped: AtomicU64,
     pub events_processed: AtomicU64,
@@ -119,6 +131,7 @@ pub struct WindowMetrics {
 
 /// Manages per-IP sliding windows, L1 deterministic filtering, and auto-cached signatures.
 pub struct SlidingWindowEngine {
+    throttles: Mutex<HttpThrottles>,
     mutation: Mutex<()>,
     cfg: WindowConfig,
     limits: crate::limits::MemoryLimits,
@@ -130,6 +143,12 @@ pub struct SlidingWindowEngine {
     pub metrics: WindowMetrics,
 }
 
+#[derive(Default)]
+struct HttpThrottles {
+    entries: HashMap<IpAddr, Instant>,
+    swept: Option<Instant>,
+}
+
 impl SlidingWindowEngine {
     pub fn new(cfg: WindowConfig) -> Self {
         Self::with_limits(cfg, crate::limits::MemoryLimits::default())
@@ -137,6 +156,7 @@ impl SlidingWindowEngine {
 
     pub fn with_limits(cfg: WindowConfig, limits: crate::limits::MemoryLimits) -> Self {
         Self {
+            throttles: Mutex::new(HttpThrottles::default()),
             cfg,
             limits,
             mutation: Mutex::new(()),
@@ -199,6 +219,50 @@ impl SlidingWindowEngine {
         self.auto_signatures
             .retain(|_, (_, expires)| *expires > Utc::now());
         self.auto_signatures.len()
+    }
+
+    /// Monotonic, short-lived HTTP state, independently bounded by the window budget.
+    pub fn retry_after_secs(&self, ip: &IpAddr) -> Option<u64> {
+        let state = self.throttles.lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = state
+            .entries
+            .get(ip)?
+            .checked_duration_since(Instant::now())?;
+        Some(
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1),
+        )
+    }
+
+    pub fn retained_throttle_count(&self) -> usize {
+        self.throttles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .len()
+    }
+
+    fn throttle(&self, ip: IpAddr) -> u64 {
+        let now = Instant::now();
+        let seconds = self.cfg.throttle_secs.clamp(1, 60);
+        let mut state = self.throttles.lock().unwrap_or_else(|e| e.into_inner());
+        if state.swept.is_none_or(|s| s.elapsed().as_secs() >= 1) {
+            state.entries.retain(|_, expiry| *expiry > now);
+            state.swept = Some(now);
+        }
+        if let Some(expiry) = state.entries.get_mut(&ip) {
+            if *expiry <= now {
+                *expiry = now + std::time::Duration::from_secs(seconds);
+            }
+        } else if state.entries.len() < self.max_windows() {
+            state
+                .entries
+                .insert(ip, now + std::time::Duration::from_secs(seconds));
+            self.metrics.http_throttles.fetch_add(1, Ordering::Relaxed);
+        }
+        seconds
     }
 
     /// Read-only exact signature enforcement, usable before an HTTP handler and
@@ -347,7 +411,9 @@ impl SlidingWindowEngine {
             win.unique_paths.insert(self.path_hasher.hash_one(path));
         }
         // Count static traffic before skipping expensive evidence collection.
-        if win.total_requests >= self.cfg.l1_flood_threshold.max(1) {
+        let over_rate = win.total_requests.saturating_sub(win.rate_checkpoint)
+            >= self.cfg.l1_flood_threshold.max(1);
+        if over_rate && self.cfg.flood_action == FloodAction::Ban {
             let reason = format!(
                 "Exceeded L1 volumetric threshold ({} requests in window)",
                 win.total_requests
@@ -360,11 +426,25 @@ impl SlidingWindowEngine {
                 reason,
             };
         }
+        let throttle = if self.cfg.flood_action == FloodAction::Throttle {
+            if over_rate {
+                win.rate_checkpoint = win.total_requests;
+                Some(self.throttle(ev.client_ip))
+            } else {
+                self.retry_after_secs(&ev.client_ip)
+            }
+        } else {
+            None
+        };
         if benign_static {
             win.status_2xx += usize::from(ev.status == 200);
             win.status_3xx += usize::from(ev.status == 304);
             self.metrics.static_ignored.fetch_add(1, Ordering::Relaxed);
-            return L1Disposition::IgnoredStatic;
+            return throttle.map_or(L1Disposition::IgnoredStatic, |seconds| {
+                L1Disposition::Throttled {
+                    retry_after_secs: seconds,
+                }
+            });
         }
         if oversized {
             win.suspicion_score = win.suspicion_score.saturating_add(3);
@@ -376,33 +456,59 @@ impl SlidingWindowEngine {
             300..=399 => win.status_3xx += 1,
             401 | 403 => {
                 win.status_401_403 += 1;
-                win.suspicion_score += 1;
-                if win.status_401_403 >= 3 {
-                    win.suspicion_score += 2;
-                    win.suspicion_reasons
-                        .insert("repeated_auth_failures".into());
-                }
             }
             404 => {
                 win.status_404 += 1;
-                if win.status_404 >= 3 {
-                    win.suspicion_score += 2;
-                    win.suspicion_reasons.insert("high_404_probe_rate".into());
+                if win.unique_404_paths.len()
+                    < self.cfg.l1_flood_threshold.clamp(4, MAX_UNIQUE_PATHS)
+                {
+                    win.unique_404_paths.insert(self.path_hasher.hash_one(path));
+                }
+                if win.status_404 >= 5
+                    && win.unique_404_paths.len() >= 4
+                    && win.suspicion_reasons.insert("high_404_probe_rate".into())
+                {
+                    win.suspicion_score = win
+                        .suspicion_score
+                        .saturating_add(self.cfg.min_suspicion_score.max(1));
                 }
             }
             500..=599 => {
                 win.status_5xx += 1;
-                win.suspicion_score += 1;
                 win.suspicion_reasons.insert("server_5xx_triggered".into());
             }
             _ => {}
+        }
+
+        // A resource authorization failure is not a failed login. Never guess routes
+        // from a suffix, User-Agent, cookie or other attacker-controlled identity.
+        let auth_route = method == "POST" && self.cfg.auth_paths.iter().any(|p| p == path);
+        if auth_route {
+            if matches!(ev.status, 401 | 403) {
+                win.auth_failures = win.auth_failures.saturating_add(1);
+            } else if (200..300).contains(&ev.status) {
+                win.auth_successes = win.auth_successes.saturating_add(1);
+            }
+        }
+        if win.auth_failures >= self.cfg.auth_failure_threshold.max(3) && win.auth_successes == 0 {
+            if win
+                .suspicion_reasons
+                .insert("repeated_auth_failures".into())
+            {
+                win.suspicion_score = win
+                    .suspicion_score
+                    .saturating_add(self.cfg.min_suspicion_score.max(1));
+            }
+        } else if win.suspicion_reasons.remove("repeated_auth_failures") {
+            win.suspicion_score = win
+                .suspicion_score
+                .saturating_sub(self.cfg.min_suspicion_score.max(1));
         }
 
         if special_count > win.max_special_chars {
             win.max_special_chars = special_count;
         }
         if special_count >= 3 {
-            win.suspicion_score += 3;
             win.suspicion_reasons
                 .insert("high_special_char_density_in_uri".into());
         }
@@ -418,6 +524,22 @@ impl SlidingWindowEngine {
             win.suspicion_score += 3;
             win.suspicion_reasons
                 .insert("sensitive_or_exploit_path_probe".into());
+        }
+
+        if ["../", "..%2f", "/etc/passwd", "/proc/self"]
+            .iter()
+            .any(|p| lower_uri.contains(p))
+        {
+            win.suspicion_reasons
+                .insert("path_traversal_pattern".into());
+        }
+        // Ordinary admin/login routes are context, not intrinsic exploit evidence.
+        if ["/.env", "/.git/", "/vendor/phpunit/"]
+            .iter()
+            .any(|p| lower_uri.contains(p))
+        {
+            win.suspicion_reasons
+                .insert("intrinsic_exploit_path".into());
         }
 
         if sql {
@@ -436,13 +558,7 @@ impl SlidingWindowEngine {
         }
 
         let sample_limit = self.cfg.max_sample_requests.min(MAX_SAMPLES);
-        if sample_limit > 0
-            && (win.sample_requests.len() < sample_limit
-                || win
-                    .sample_requests
-                    .iter()
-                    .any(|(rank, _)| *rank < win.suspicion_score.saturating_sub(previous_score)))
-        {
+        if sample_limit > 0 {
             let priority = win.suspicion_score.saturating_sub(previous_score);
             // Redact before taking an excerpt, so clipping cannot hide a credential key.
             let evidence = redact_sensitive(&decode_url(&redact_sensitive(&raw_uri), true));
@@ -474,24 +590,32 @@ impl SlidingWindowEngine {
                 ev.status
             );
             trace.shrink_to_fit();
-            if let Some((rank, _)) = win.sample_requests.iter_mut().find(|(_, s)| s == &trace) {
+            if let Some((rank, _, count)) =
+                win.sample_requests.iter_mut().find(|(_, s, _)| s == &trace)
+            {
                 *rank = (*rank).max(priority);
+                *count = count.saturating_add(1);
             } else if win.sample_requests.len() < sample_limit {
-                win.sample_requests.push((priority, trace));
-            } else if let Some((idx, (lowest, _))) = win
+                win.sample_requests.push((priority, trace, 1));
+            } else if let Some((idx, (lowest, _, _))) = win
                 .sample_requests
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, (p, _))| *p)
+                .min_by_key(|(_, (p, _, _))| *p)
                 && priority > *lowest
             {
-                win.sample_requests[idx] = (priority, trace);
+                win.sample_requests[idx] = (priority, trace, 1);
             }
         }
 
-        L1Disposition::Buffered {
-            current_suspicion_score: win.suspicion_score,
-        }
+        throttle.map_or(
+            L1Disposition::Buffered {
+                current_suspicion_score: win.suspicion_score,
+            },
+            |seconds| L1Disposition::Throttled {
+                retry_after_secs: seconds,
+            },
+        )
     }
 
     /// Drains all IP windows that have crossed `min_suspicion_score` (and either expired
@@ -562,10 +686,10 @@ impl SlidingWindowEngine {
 
     pub fn max_windows(&self) -> usize {
         // Reserve heap overhead as well as the bounded sample and cardinality storage.
-        let bytes = 2048
+        let bytes = 2304
             + 4 * (MAX_SANITIZED_UA_LEN * 4 + 128)
             + self.cfg.max_sample_requests.min(MAX_SAMPLES) * (MAX_SANITIZED_URI_LEN * 4 + 128)
-            + self.cfg.l1_flood_threshold.clamp(1, MAX_UNIQUE_PATHS) * 32;
+            + self.cfg.l1_flood_threshold.clamp(4, MAX_UNIQUE_PATHS) * 64;
         self.cfg
             .max_tracked_ips
             .max(1)
@@ -584,6 +708,9 @@ impl SlidingWindowEngine {
             total_requests: win.total_requests,
             req_per_sec: (req_per_sec * 100.0).round() / 100.0,
             unique_paths: win.unique_paths.len(),
+            unique_404_paths: win.unique_404_paths.len(),
+            auth_failures: win.auth_failures,
+            auth_successes: win.auth_successes,
             status_2xx: win.status_2xx,
             status_3xx: win.status_3xx,
             status_401_403: win.status_401_403,
@@ -594,7 +721,17 @@ impl SlidingWindowEngine {
             prompt_injection_flag: win.prompt_injection_flag,
             l1_suspicion_reasons: win.suspicion_reasons.iter().cloned().collect(),
             user_agents: win.user_agents.iter().cloned().collect(),
-            sample_requests: win.sample_requests.iter().map(|(_, s)| s.clone()).collect(),
+            sample_requests: win
+                .sample_requests
+                .iter()
+                .map(|(_, s, count)| {
+                    if *count > 1 {
+                        format!("{s} [x{count}]")
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect(),
         }
     }
 

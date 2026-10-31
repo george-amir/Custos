@@ -316,6 +316,7 @@ async fn slow_firewall_does_not_block_http_response_or_runtime() {
         Arc::new(DecisionStore::open(dir.path().join("decisions.jsonl"), 3600).unwrap()),
         Arc::new(SlidingWindowEngine::new(custos::config::WindowConfig {
             l1_flood_threshold: 1,
+            flood_action: custos::config::FloodAction::Ban,
             ..Default::default()
         })),
         Arc::new(JevBatchAnalyzer::new(Default::default(), true).unwrap()),
@@ -397,7 +398,8 @@ async fn api_reports_enforcement_failure_and_reconciliation_retries_bans_and_unb
     assert_eq!(firewall.metrics.rules_applied.load(Ordering::Relaxed), 0);
     runner.0.store(false, Ordering::Relaxed);
     p.reconcile_firewall().unwrap();
-    assert_eq!(firewall.metrics.rules_applied.load(Ordering::Relaxed), 1);
+    // Background retry and explicit reconciliation may both apply the idempotent rule.
+    assert!(firewall.metrics.rules_applied.load(Ordering::Relaxed) >= 1);
     runner.0.store(true, Ordering::Relaxed);
     let response = app
         .oneshot(

@@ -61,6 +61,15 @@ pub async fn custos_bouncer_middleware(
             .into_response();
     }
 
+    if let Some(seconds) = pipeline.window.retry_after_secs(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", seconds.to_string())],
+            "Temporary request rate limit",
+        )
+            .into_response();
+    }
+
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();

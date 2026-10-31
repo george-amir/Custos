@@ -47,6 +47,9 @@ async fn require_admin(
 
 #[derive(Debug, Deserialize)]
 pub struct CheckQuery {
+    /// Nginx auth_request accepts only 2xx/401/403. Proxy maps this 403 to 429.
+    #[serde(default)]
+    pub auth_request: bool,
     pub ip: Option<String>,
     pub method: Option<String>,
     pub uri: Option<String>,
@@ -239,6 +242,28 @@ async fn handle_bouncer_check(
                 action: action.into(),
                 threat_class: (status == StatusCode::FORBIDDEN).then_some(reason.clone()),
                 reason: Some(reason),
+                noul_probability: None,
+            }),
+        )
+    } else if let Some(seconds) = state.window.retry_after_secs(&ip) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_str(&seconds.to_string()).expect("bounded integer"),
+        );
+        headers.insert("x-custos-action", HeaderValue::from_static("throttle"));
+        (
+            if query.auth_request {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            },
+            headers,
+            Json(BouncerCheckResponse {
+                ip: ip.to_string(),
+                action: "throttle".into(),
+                threat_class: None,
+                reason: Some("Temporary request rate limit".into()),
                 noul_probability: None,
             }),
         )
@@ -446,6 +471,9 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
         .load(Ordering::Relaxed);
     let static_ignored = state.window.metrics.static_ignored.load(Ordering::Relaxed);
     let l1_bans = state.window.metrics.l1_instant_bans.load(Ordering::Relaxed);
+    let http_throttles = state.window.metrics.http_throttles.load(Ordering::Relaxed);
+    let retained_throttles = state.window.retained_throttle_count();
+    let evidence_rejected = state.jev.metrics.evidence_rejected.load(Ordering::Relaxed);
     let promoted = state
         .window
         .metrics
@@ -502,9 +530,17 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
          # HELP custos_expired_evidence_dropped_total Oldest expired evidence dropped at backlog capacity.\n\
          # TYPE custos_expired_evidence_dropped_total counter\n\
          custos_expired_evidence_dropped_total {expired_dropped}\n\
-         # HELP custos_l1_instant_bans_total Instant bans triggered by L1 flood or auto-signature cache.\n\
+         # HELP custos_l1_instant_bans_total Cached-signature bans or explicitly opted-in strict volume bans.\n\
          # TYPE custos_l1_instant_bans_total counter\n\
          custos_l1_instant_bans_total {l1_bans}\n\
+         # HELP custos_http_throttles_total Short HTTP-only rate limits created.\n\
+         # TYPE custos_http_throttles_total counter\n\
+         custos_http_throttles_total {http_throttles}\n\
+         # TYPE custos_http_throttles_retained gauge\n\
+         custos_http_throttles_retained {retained_throttles}\n\
+         # HELP custos_jev_evidence_rejected_total Model convictions rejected by runtime evidence policy.\n\
+         # TYPE custos_jev_evidence_rejected_total counter\n\
+         custos_jev_evidence_rejected_total {evidence_rejected}\n\
          # HELP custos_windows_promoted_total Suspicious IP windows promoted to TypeSafe Jev L2.\n\
          # TYPE custos_windows_promoted_total counter\n\
          custos_windows_promoted_total {promoted}\n\

@@ -96,6 +96,15 @@ pub struct LogSourceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowConfig {
+    #[serde(default)]
+    pub flood_action: FloodAction,
+    #[serde(default = "default_throttle_secs")]
+    pub throttle_secs: u64,
+    /// Exact POST authentication paths. Empty disables status-only auth convictions.
+    #[serde(default)]
+    pub auth_paths: Vec<String>,
+    #[serde(default = "default_auth_failure_threshold")]
+    pub auth_failure_threshold: usize,
     #[serde(default = "default_window_secs")]
     pub window_secs: u64,
     #[serde(default = "default_flush_interval_ms")]
@@ -112,6 +121,15 @@ pub struct WindowConfig {
     /// At least one active/expired window pair is reserved.
     #[serde(default = "default_max_state_bytes")]
     pub max_state_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloodAction {
+    #[default]
+    Throttle,
+    /// Explicit opt-in to the pre-v0.4 volume-only durable IP ban policy.
+    Ban,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +196,14 @@ fn default_flush_interval_ms() -> u64 {
 }
 fn default_l1_flood_threshold() -> usize {
     120
+}
+
+fn default_auth_failure_threshold() -> usize {
+    10
+}
+
+fn default_throttle_secs() -> u64 {
+    5
 }
 fn default_min_suspicion_score() -> u32 {
     2
@@ -254,6 +280,10 @@ impl Default for DaemonConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
+            flood_action: FloodAction::default(),
+            throttle_secs: default_throttle_secs(),
+            auth_paths: Vec::new(),
+            auth_failure_threshold: default_auth_failure_threshold(),
             window_secs: default_window_secs(),
             flush_interval_ms: default_flush_interval_ms(),
             l1_flood_threshold: default_l1_flood_threshold(),
@@ -262,6 +292,32 @@ impl Default for WindowConfig {
             max_tracked_ips: default_max_tracked_ips(),
             max_state_bytes: default_max_state_bytes(),
         }
+    }
+}
+
+impl WindowConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=60).contains(&self.throttle_secs),
+            "window.throttle_secs must be between 1 and 60"
+        );
+        anyhow::ensure!(
+            self.auth_failure_threshold >= 3,
+            "window.auth_failure_threshold must be at least 3"
+        );
+        anyhow::ensure!(
+            self.auth_paths.len() <= 128
+                && self.auth_paths.iter().map(String::len).sum::<usize>() <= 64 * 1024,
+            "Authentication path configuration exceeds its count/byte limit"
+        );
+        anyhow::ensure!(
+            self.auth_paths.iter().all(|p| p.starts_with('/')
+                && p.len() <= 2048
+                && !p.contains(['?', '#'])
+                && !p.chars().any(char::is_control)),
+            "Authentication paths must be exact absolute paths without a query or fragment (maximum 2048 bytes)"
+        );
+        Ok(())
     }
 }
 
@@ -313,6 +369,7 @@ impl AppConfig {
             cfg.hub.api_token = tok;
         }
         cfg.memory.validate()?;
+        cfg.window.validate()?;
         Ok(cfg)
     }
 
