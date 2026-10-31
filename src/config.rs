@@ -80,8 +80,9 @@ pub enum DecisionCapacityPolicy {
     FailClosed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
 pub enum LogFormat {
     NginxCombined,
     Json,

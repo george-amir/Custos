@@ -19,6 +19,12 @@ trusted_proxies = []
 path = "tests/fixtures/sample_access.log"
 format = "nginx_combined"
 
+# Native Traefik / Dokploy and Caddy access logs use format = "json".
+# For a Dokploy host, replace the source above with:
+# [[logs]]
+# path = "/etc/dokploy/traefik/dynamic/access.log"
+# format = "json"
+
 [window]
 # Sliding behavioral window duration in seconds per IP
 window_secs = 15

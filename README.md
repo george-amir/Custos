@@ -38,6 +38,14 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 ---
 
+## v0.4.1: Native Traefik / Dokploy JSON access logs
+
+[Download v0.4.1](https://github.com/george-amir/Custos/releases/tag/v0.4.1). The JSON parser now recognizes Traefik's native field names, including `ClientHost` (or `ClientAddr`), `RequestMethod`, `RequestPath`, and `DownstreamStatus`. It preserves the request timestamp with nanosecond precision, using `StartUTC`, then `StartLocal`, then `time`. Client-facing status and bytes are used even when Traefik generates the response itself (`OriginStatus = 0`). Traefik's server-wide `RequestCount` never becomes a per-IP request count.
+
+Use `format = "json"` for Traefik, Caddy, or flat JSON access logs. Live `run --log` now accepts `--format json` (also `--log-format json`); omitting it preserves the Nginx combined default. Unknown format names are rejected instead of silently selecting another parser. See the [Dokploy configuration below](#traefik--dokploy-json-access-logs).
+
+Validation: 153 Rust tests pass, including eight new Traefik regressions for client identity, IPv6, timestamps, proxy-generated responses, request counting, replay, and live ingestion. The original five pasted records parse in isolated mock replay and yield one scanner verdict. Docker validation also generates real Traefik JSON and replays it through the production image with networking and native firewall enforcement disabled.
+
 ## v0.4.0: False-positive safeguards and availability at saturation
 
 [Download v0.4.0](https://github.com/george-amir/Custos/releases/tag/v0.4.0) for Linux, macOS, or Windows.
@@ -200,7 +208,7 @@ curl -fsSL https://raw.githubusercontent.com/george-amir/Custos/main/install.sh 
 
 #### Or Install Directly via Cargo (No `protoc` Required)
 ```bash
-cargo install --git https://github.com/george-amir/Custos.git --tag v0.4.0 --locked
+cargo install --git https://github.com/george-amir/Custos.git --tag v0.4.1 --locked
 ```
 
 ### 2. Zero-Config Setup & Run (`custos init`)
@@ -462,6 +470,38 @@ http:
         trustForwardHeader: true
 ```
 
+### Traefik / Dokploy JSON Access Logs
+
+Set the access-log source explicitly in the Custos configuration (replace an existing entry for the same file rather than adding a duplicate):
+
+```toml
+[[logs]]
+path = "/etc/dokploy/traefik/dynamic/access.log"
+format = "json"
+```
+
+Restart the existing Custos daemon after updating its binary and configuration. For a manual run, choose one source configuration:
+
+```sh
+# Use the [[logs]] entries from your configuration:
+sudo custos --config /etc/custos/config.toml run
+
+# Or supply an additional JSON log explicitly:
+sudo custos run --log /etc/dokploy/traefik/dynamic/access.log --format json
+```
+
+Normal daemon startup reads new records from the end of the file. `--from-start` includes existing records. Replay accepts the same JSON schema:
+
+```sh
+custos --config test-config.toml replay --log /path/to/traefik-access.jsonl --format json --mock-jev
+```
+
+For an isolated replay, use a test configuration with `firewall.enabled = false`, a separate `daemon.decisions_file`, and Hub synchronization disabled. Replay evaluates historical records; it is not a read-only parser command.
+
+The parser uses the logged client address, never `RequestHost`, `ServiceAddr`, or a raw forwarded header. Keep `ClientHost` or `ClientAddr`, `RequestMethod`, `RequestPath`, and `DownstreamStatus` in the [Traefik JSON access log](https://doc.traefik.io/traefik/v3.5/reference/install-configuration/observability/logs-and-accesslogs/#json-format-fields). `request_User-Agent` and `request_Referer` are optional; other logged headers are ignored. If Custos runs in a container, mount the log's parent directory read-only and configure its path inside that container so file rotation remains visible.
+
+Traefik's TLS/ACME diagnostic messages from `docker logs dokploy-traefik` are separate from HTTP access records and are not ingested as HTTP traffic.
+
 ---
 
 ## 🌐 Multi-Node gRPC Fleet Sync (`CustosHub`)
@@ -506,7 +546,7 @@ Because `custos` vendors its generated Protobuf/gRPC code in [`src/hub_proto.rs`
 ### Add to `Cargo.toml`
 ```toml
 [dependencies]
-custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.4.0" }
+custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.4.1" }
 ```
 
 ### Embed `custos_bouncer_middleware` in an Axum Router

@@ -59,6 +59,16 @@ enum Commands {
         #[arg(long)]
         log: Option<PathBuf>,
 
+        /// Format of the file supplied with --log (json supports Traefik and Caddy)
+        #[arg(
+            long,
+            alias = "log-format",
+            value_enum,
+            ignore_case = true,
+            requires = "log"
+        )]
+        format: Option<LogFormat>,
+
         /// Read tailed log files from the beginning instead of seeking to EOF
         #[arg(long, default_value_t = false)]
         from_start: bool,
@@ -90,9 +100,9 @@ enum Commands {
         #[arg(long)]
         log: PathBuf,
 
-        /// Log format: nginx_combined or json
-        #[arg(long, default_value = "nginx_combined")]
-        format: String,
+        /// Log format (json supports native Traefik, Caddy, and flat JSON records)
+        #[arg(long, value_enum, ignore_case = true, default_value = "nginx_combined")]
+        format: LogFormat,
 
         /// Use local deterministic Jev simulator (no API key required)
         #[arg(long, default_value_t = false)]
@@ -253,6 +263,7 @@ async fn async_main() -> Result<()> {
 
     let command = cli.command.unwrap_or(Commands::Run {
         log: None,
+        format: None,
         from_start: false,
         mock_jev: false,
         firewall_backend: None,
@@ -268,6 +279,7 @@ async fn async_main() -> Result<()> {
         } => cmd_init(&output, firewall_live),
         Commands::Run {
             log,
+            format,
             from_start,
             mock_jev,
             firewall_backend,
@@ -278,7 +290,7 @@ async fn async_main() -> Result<()> {
             if let Some(log_path) = log {
                 cfg.logs.push(LogSourceConfig {
                     path: log_path,
-                    format: LogFormat::NginxCombined,
+                    format: format.unwrap_or(LogFormat::NginxCombined),
                 });
             }
             if cfg.logs.is_empty() {
@@ -315,11 +327,6 @@ async fn async_main() -> Result<()> {
             hub,
             node_id,
         } => {
-            let fmt = if format.eq_ignore_ascii_case("json") {
-                LogFormat::Json
-            } else {
-                LogFormat::NginxCombined
-            };
             if let Some(b) = firewall_backend {
                 cfg.firewall.backend = parse_backend(&b);
             }
@@ -333,7 +340,7 @@ async fn async_main() -> Result<()> {
             if let Some(nid) = node_id {
                 cfg.hub.node_id = nid;
             }
-            run_replay(cfg, &log, fmt, mock_jev).await
+            run_replay(cfg, &log, format, mock_jev).await
         }
         Commands::Hub { listen, quorum } => run_hub_server(&listen, quorum, &cfg).await,
         Commands::HubSync {
