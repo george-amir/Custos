@@ -204,7 +204,7 @@ fn credentials_are_redacted_before_any_outbound_state_is_built() {
         "SECOND_SECRET",
         "THIRD_SECRET",
     ] {
-        assert!(!state.contains(secret), "leaked {secret}");
+        assert!(!state.contains(secret), "credential redaction failed");
     }
     assert!(state.contains("REDACTED"));
 }
