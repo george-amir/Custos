@@ -248,6 +248,8 @@ fn docker_config_monitors_mounted_nginx_logs_and_enforces_bans() {
 fn linux_arm64_installer_target_has_a_release_artifact() {
     let installer = include_str!("../install.sh");
     let releases = include_str!("../.github/workflows/release.yml");
+    // Both YAML mappings and JSON-backed dynamic matrices declare target fields.
+    let matrix_targets = regex::Regex::new(r#""?target"?\s*:\s*"?([a-zA-Z0-9_-]+)"?"#).unwrap();
     for target in [
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
@@ -256,7 +258,9 @@ fn linux_arm64_installer_target_has_a_release_artifact() {
     ] {
         assert!(installer.contains(target));
         assert!(
-            releases.contains(&format!("target: {target}")),
+            matrix_targets
+                .captures_iter(releases)
+                .any(|m| &m[1] == target),
             "installer target {target} must be published"
         );
     }

@@ -14,6 +14,10 @@ on:
         description: "Resume only Intel macOS assets for an existing draft release"
         type: boolean
         default: false
+      publish_only:
+        description: "Verify and publish an existing complete draft without rebuilding"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -21,6 +25,7 @@ permissions:
 
 jobs:
   build-release:
+    if: ${{ !inputs.publish_only }}
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -77,6 +82,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-release:
+    if: ${{ always() && (needs.build-release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.publish_only)) }}
     name: Publish complete release
     needs: build-release
     runs-on: ubuntu-latest
@@ -98,7 +104,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
         run: |
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'custos-*' --dir dist
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-metadata.json
+          RELEASE_API_URL=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)
+          gh api "$RELEASE_API_URL" > release-metadata.json
           python3 .github/scripts/prepare-release.py "$RELEASE_TAG" dist release-metadata.json
           gh release upload "$RELEASE_TAG" dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
       - name: Publish after every platform asset is uploaded
