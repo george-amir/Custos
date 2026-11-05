@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc,
@@ -31,9 +31,30 @@ struct Fixture {
     downloads: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     task: Option<std::thread::JoinHandle<()>>,
+    binary: PathBuf,
+    _directory: tempfile::TempDir,
 }
 impl Fixture {
-    fn start(metadata: serde_json::Value) -> Self {
+    fn start(version: &str, alter: impl FnOnce(&mut serde_json::Value)) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join(if cfg!(windows) {
+            "candidate.exe"
+        } else {
+            "candidate"
+        });
+        std::fs::copy(env!("CARGO_BIN_EXE_custos"), &binary).unwrap();
+        // GNU debug symbols can exceed the production download cap. Strip only
+        // the Linux fixture; preserve Mach-O signatures and Windows executables.
+        #[cfg(target_os = "linux")]
+        assert!(
+            Command::new("strip")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut metadata = metadata(version, &binary);
+        alter(&mut metadata);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let root = format!("http://{}/", listener.local_addr().unwrap());
@@ -41,6 +62,7 @@ impl Fixture {
         let stop = Arc::new(AtomicBool::new(false));
         let (requests, done) = (downloads.clone(), stop.clone());
         let bytes = serde_json::to_vec(&metadata).unwrap();
+        let served_binary = binary.clone();
         let task = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let Ok((mut socket, _)) = listener.accept() else {
@@ -68,7 +90,7 @@ impl Fixture {
                 }
                 if asset {
                     requests.fetch_add(1, Ordering::Relaxed);
-                    let mut file = std::fs::File::open(env!("CARGO_BIN_EXE_custos")).unwrap();
+                    let mut file = std::fs::File::open(&served_binary).unwrap();
                     let size = file.metadata().unwrap().len();
                     if write!(
                         socket,
@@ -106,6 +128,8 @@ impl Fixture {
             downloads,
             stop,
             task: Some(task),
+            binary,
+            _directory: directory,
         }
     }
     fn client(&self) -> ReleaseUpdater {
@@ -123,8 +147,7 @@ impl Drop for Fixture {
     }
 }
 
-fn metadata(version: &str) -> serde_json::Value {
-    let binary = Path::new(env!("CARGO_BIN_EXE_custos"));
+fn metadata(version: &str, binary: &Path) -> serde_json::Value {
     serde_json::json!({"tag_name":format!("v{version}"), "draft":false, "prerelease":false,
         "assets":[{"name":binary_asset_name(release_target().unwrap()), "size":binary.metadata().unwrap().len(),
             "state":"uploaded", "digest":format!("sha256:{}", file_digest(binary)),
@@ -133,7 +156,7 @@ fn metadata(version: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn checking_is_read_only_and_versions_compare_numerically() {
-    let fixture = Fixture::start(metadata("0.10.0"));
+    let fixture = Fixture::start("0.10.0", |_| {});
     let UpdateStatus::Available(plan) = fixture.client().check("0.9.0", None).await.unwrap() else {
         panic!("expected update");
     };
@@ -162,8 +185,7 @@ async fn missing_digests_oversized_and_unpublished_releases_are_refused() {
         "missing_target",
         "mismatched_tag",
     ] {
-        let mut value = metadata("0.6.0");
-        match case {
+        let fixture = Fixture::start("0.6.0", |value| match case {
             "missing_digest" => value["assets"][0]["digest"] = serde_json::Value::Null,
             "oversize" => {
                 value["assets"][0]["size"] = (custos::update::MAX_BINARY_BYTES + 1).into()
@@ -172,8 +194,7 @@ async fn missing_digests_oversized_and_unpublished_releases_are_refused() {
             "draft" => value["draft"] = true.into(),
             "missing_target" => value["assets"] = serde_json::json!([]),
             _ => {}
-        }
-        let fixture = Fixture::start(value);
+        });
         let requested = if case == "mismatched_tag" {
             Some("v0.7.0")
         } else {
@@ -211,14 +232,14 @@ fn exercise_install(case: &str) {
     let original = file_digest(&target);
     let journal = directory.path().join("ledger");
     std::fs::write(&journal, b"preserve active bans and pending cleanup\n").unwrap();
-    let mut value = metadata(env!("CARGO_PKG_VERSION"));
-    if case == "checksum" {
-        value["assets"][0]["digest"] = format!("sha256:{}", "0".repeat(64)).into();
-    }
-    if case == "version" {
-        value["tag_name"] = "v9.9.9".into();
-    }
-    let fixture = Fixture::start(value);
+    let fixture = Fixture::start(env!("CARGO_PKG_VERSION"), |value| {
+        if case == "checksum" {
+            value["assets"][0]["digest"] = format!("sha256:{}", "0".repeat(64)).into();
+        }
+        if case == "version" {
+            value["tag_name"] = "v9.9.9".into();
+        }
+    });
     let output = Command::new(&target)
         .args(["--exact", "update_worker", "--ignored", "--nocapture"])
         .env("CUSTOS_TEST_UPDATE_SOURCE", &fixture.root)
@@ -234,10 +255,7 @@ fn exercise_install(case: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     if case == "ok" {
-        assert_eq!(
-            file_digest(&target),
-            file_digest(Path::new(env!("CARGO_BIN_EXE_custos")))
-        );
+        assert_eq!(file_digest(&target), file_digest(&fixture.binary));
         let version = Command::new(&target).arg("-v").output().unwrap();
         assert!(version.status.success());
         assert_eq!(

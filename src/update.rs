@@ -301,7 +301,11 @@ async fn verify_version(candidate: &Path, expected: &Version) -> Result<()> {
 fn replace_current(current: &Path, candidate: &Path, directory: tempfile::TempDir) -> Result<()> {
     let backup = directory.path().join("previous-binary");
     std::fs::copy(current, &backup).context("Could not preserve the current binary")?;
-    std::fs::File::open(&backup)?.sync_all()?;
+    // Windows FlushFileBuffers requires a handle opened for writing.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&backup)?
+        .sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
