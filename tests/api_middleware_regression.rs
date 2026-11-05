@@ -304,6 +304,7 @@ async fn slow_firewall_does_not_block_http_response_or_runtime() {
     });
     let firewall = Arc::new(FirewallBouncer::with_runner(
         FirewallConfig {
+            protect_docker: false,
             enabled: true,
             backend: FirewallBackend::Pf,
             dry_run: false,
@@ -360,6 +361,7 @@ async fn api_reports_enforcement_failure_and_reconciliation_retries_bans_and_unb
     let runner = Arc::new(SwitchableFirewall(AtomicBool::new(true)));
     let firewall = Arc::new(FirewallBouncer::with_runner(
         FirewallConfig {
+            protect_docker: false,
             enabled: true,
             backend: FirewallBackend::Pf,
             dry_run: false,

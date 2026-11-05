@@ -238,6 +238,7 @@ async fn test_grpc_custoshub_multi_node_sync_and_batched_firewall() {
     // 3. Node B (a completely fresh server) pulls incremental binary deltas from CustosHub via gRPC `pull_deltas`
     let dir_b = tempdir().unwrap();
     let fw_b = Arc::new(FirewallBouncer::new(FirewallConfig {
+        protect_docker: false,
         enabled: true,
         backend: FirewallBackend::Pf,
         dry_run: true,

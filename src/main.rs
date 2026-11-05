@@ -42,6 +42,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// List verified crawlers and manage their persisted policies
+    Crawlers {
+        #[command(subcommand)]
+        action: CrawlerAction,
+        #[arg(long, global = true, default_value = "http://127.0.0.1:8085")]
+        api_url: String,
+    },
+    /// Show the bounded, redacted evidence for one active ban (admin token required)
+    Explain {
+        ip: IpAddr,
+        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        api_url: String,
+    },
+    /// Inspect log ingestion health (admin token required)
+    Logs {
+        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        api_url: String,
+    },
     /// Auto-detect host OS firewall & web server logs and generate a ready-to-run config.toml
     Init {
         /// Output path for the generated configuration file
@@ -234,6 +252,25 @@ enum ServiceAction {
     Uninstall,
 }
 
+#[derive(Subcommand, Debug)]
+enum CrawlerAction {
+    List,
+    Identify {
+        ip: IpAddr,
+    },
+    Block {
+        id: String,
+    },
+    #[command(alias = "unblock")]
+    Allow {
+        id: String,
+    },
+    Normal {
+        id: String,
+    },
+    Refresh,
+}
+
 fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--windows-service") {
         custos::windows_service::dispatch(run_async_main)
@@ -273,6 +310,26 @@ async fn async_main() -> Result<()> {
     });
 
     match command {
+        Commands::Crawlers { action, api_url } => {
+            cmd_crawlers(action, &api_url, &cfg.daemon.api_token).await
+        }
+        Commands::Explain { ip, api_url } => {
+            cmd_admin_get(
+                &format!(
+                    "{}/v1/decisions/{ip}/evidence",
+                    api_url.trim_end_matches('/')
+                ),
+                &cfg.daemon.api_token,
+            )
+            .await
+        }
+        Commands::Logs { api_url } => {
+            cmd_admin_get(
+                &format!("{}/v1/logs", api_url.trim_end_matches('/')),
+                &cfg.daemon.api_token,
+            )
+            .await
+        }
         Commands::Init {
             output,
             firewall_live,
@@ -388,7 +445,7 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Unban { ip, api_url } => cmd_unban(ip, &api_url, &cfg.daemon.api_token).await,
-        Commands::Check { ip, api_url } => cmd_check(ip, &api_url).await,
+        Commands::Check { ip, api_url } => cmd_check(ip, &api_url, &cfg.daemon.api_token).await,
         Commands::Stats { api_url } => cmd_stats(&api_url).await,
         Commands::Service { action } => match action {
             ServiceAction::Install {
@@ -505,12 +562,13 @@ async fn cmd_hub_sync(cfg: AppConfig, hub_endpoint: &str, since_seq: u64) -> Res
         cfg.memory.max_provider_response_bytes,
     )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline = SecurityPipeline::new_with_limits(
+    let pipeline = SecurityPipeline::new_with_crawlers(
         store.clone(),
         window.clone(),
         jev.clone(),
         firewall.clone(),
         cfg.memory.clone(),
+        cfg.crawlers.clone(),
     )?;
 
     let (latest_seq, ips_applied, sigs_applied) = pull_and_apply_via_grpc(
@@ -559,14 +617,39 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
         cfg.memory.max_provider_response_bytes,
     )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let mut pipeline = SecurityPipeline::new_with_limits(
+    let mut pipeline = SecurityPipeline::new_with_crawlers(
         store.clone(),
         window.clone(),
         jev.clone(),
         firewall.clone(),
         cfg.memory.clone(),
+        cfg.crawlers.clone(),
     )?;
     pipeline.on_decision_capacity = cfg.daemon.on_decision_capacity;
+    pipeline.trusted_proxies = Arc::new(cfg.daemon.trusted_proxies.clone());
+    let crawler_refresh_task = if cfg.crawlers.auto_refresh {
+        let registry = pipeline.crawlers.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                registry.config.refresh_interval_secs,
+            ));
+            loop {
+                ticker.tick().await;
+                match registry.refresh().await {
+                    Ok(feeds) => {
+                        for feed in feeds.into_iter().filter(|feed| feed.last_error.is_some()) {
+                            tracing::warn!(crawler = %feed.entry.id, error = ?feed.last_error, "Crawler publisher refresh failed; verification expiry remains unchanged");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Crawler feed refresh failed; stale identities receive normal analysis")
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // The pipeline worker reconciles enforcement; compact the durable journal separately.
     let sweep_pipeline = pipeline.clone();
@@ -676,27 +759,34 @@ async fn run_daemon(cfg: AppConfig, from_start: bool, mock_jev: bool) -> Result<
         "Custos daemon listening (HTTP Bouncer: GET /v1/bouncer/check?ip=<IP>, Metrics: GET /metrics)"
     );
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            for task in &tailer_tasks {
-                task.abort();
-            }
-            for task in tailer_tasks {
-                let _ = task.await;
-            }
-            // Finish any in-flight batch before the final forced drain.
-            let _ = stop_flush.send(());
-            let _ = flush_task.await;
-            info!("Shutdown signal received; flushing pending windows and compacting store...");
-            if let Err(error) = shutdown_pipeline.flush_and_analyze(true).await {
-                error!(%error, "Final analysis failed during shutdown");
-            }
-            if let Err(error) = shutdown_pipeline.store.compact_persistence_file() {
-                error!(%error, "Final persistence compaction failed");
-            }
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        if let Some(task) = crawler_refresh_task {
+            task.abort();
+            let _ = task.await;
+        }
+        for task in &tailer_tasks {
+            task.abort();
+        }
+        for task in tailer_tasks {
+            let _ = task.await;
+        }
+        // Finish any in-flight batch before the final forced drain.
+        let _ = stop_flush.send(());
+        let _ = flush_task.await;
+        info!("Shutdown signal received; flushing pending windows and compacting store...");
+        if let Err(error) = shutdown_pipeline.flush_and_analyze(true).await {
+            error!(%error, "Final analysis failed during shutdown");
+        }
+        if let Err(error) = shutdown_pipeline.store.compact_persistence_file() {
+            error!(%error, "Final persistence compaction failed");
+        }
+    })
+    .await?;
     Ok(())
 }
 
@@ -722,12 +812,13 @@ async fn run_replay(
         cfg.memory.max_provider_response_bytes,
     )?);
     let firewall = Arc::new(FirewallBouncer::new(cfg.firewall.clone()));
-    let pipeline = SecurityPipeline::new_with_limits(
+    let pipeline = SecurityPipeline::new_with_crawlers(
         store.clone(),
         window.clone(),
         jev.clone(),
         firewall.clone(),
         cfg.memory.clone(),
+        cfg.crawlers.clone(),
     )?;
 
     let event_count = visit_log_file(log_path, format, |ev| pipeline.process_event(&ev))?;
@@ -981,18 +1072,101 @@ async fn cmd_unban(ip: IpAddr, api_url: &str, api_token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_check(ip: IpAddr, api_url: &str) -> Result<()> {
+async fn cmd_check(ip: IpAddr, api_url: &str, token: &str) -> Result<()> {
     let url = format!(
         "{}/v1/bouncer/check?ip={}",
         api_url.trim_end_matches('/'),
         ip
     );
-    let resp = reqwest::get(&url).await?;
+    let request = reqwest::Client::new().get(&url);
+    let request = if token.is_empty() {
+        request
+    } else {
+        request.bearer_auth(token)
+    };
+    let resp = request.send().await?;
     let status = resp.status();
     let body: BouncerCheckResponse = resp.json().await?;
     println!(
         "HTTP {} -> ip={} action={} threat={:?} noul={:?}",
         status, body.ip, body.action, body.threat_class, body.noul_probability
+    );
+    Ok(())
+}
+
+async fn cmd_admin_get(url: &str, token: &str) -> Result<()> {
+    anyhow::ensure!(
+        !token.is_empty(),
+        "Configure daemon.api_token or CUSTOS_API_TOKEN for admin commands"
+    );
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
+    );
+    Ok(())
+}
+
+async fn cmd_crawlers(action: CrawlerAction, api_url: &str, token: &str) -> Result<()> {
+    let base = api_url.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let request = match action {
+        CrawlerAction::List => client.get(format!("{base}/v1/crawlers")),
+        CrawlerAction::Identify { ip } => client
+            .get(format!("{base}/v1/crawlers/identify"))
+            .query(&[("ip", ip)]),
+        action => {
+            anyhow::ensure!(
+                !token.is_empty(),
+                "Configure daemon.api_token or CUSTOS_API_TOKEN for crawler policy changes"
+            );
+            match action {
+                CrawlerAction::Refresh => client
+                    .post(format!("{base}/v1/crawlers/refresh"))
+                    .bearer_auth(token),
+                CrawlerAction::Block { ref id }
+                | CrawlerAction::Allow { ref id }
+                | CrawlerAction::Normal { ref id } => {
+                    let policy = match &action {
+                        CrawlerAction::Block { .. } => "block",
+                        CrawlerAction::Allow { .. } => "allow",
+                        _ => "normal",
+                    };
+                    anyhow::ensure!(
+                        custos::crawlers::CATALOG
+                            .iter()
+                            .any(|entry| entry.id == id.as_str()),
+                        "Unknown crawler identity"
+                    );
+                    client
+                        .put(format!("{base}/v1/crawlers/{id}"))
+                        .bearer_auth(token)
+                        .json(&serde_json::json!({"policy":policy}))
+                }
+                _ => unreachable!(),
+            }
+        }
+    };
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "Crawler request failed ({status}): {}",
+            response.text().await?
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response.json::<serde_json::Value>().await?)?
     );
     Ok(())
 }

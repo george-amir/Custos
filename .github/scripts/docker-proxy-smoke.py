@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the README's Nginx integration in an isolated Docker network."""
 import datetime
+import ipaddress
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -43,10 +45,15 @@ throttle_secs = 5
 enabled = false
 ''')
         docker("network", "create", name)
+        network = json.loads(docker("network", "inspect", name).stdout)[0]
+        subnet = ipaddress.ip_network(network["IPAM"]["Config"][0]["Subnet"])
+        proxy_address = str(subnet.network_address + 3)
+        config_path = tmp.joinpath("config.toml")
+        config_path.write_text(config_path.read_text().replace("[daemon]\n", '[daemon]\ntrusted_proxies = ' + json.dumps([proxy_address]) + '\n') + '\n[crawlers]\nauto_refresh = false\n')
         try:
             docker("run", "-d", "--name", engine, "--network", name,
                    "--network-alias", "custos", "-v", f"{directory}:/test:ro",
-                   "custos:ci", "--config", "/test/config.toml", "run", "--mock-jev")
+                   os.environ.get("CUSTOS_TEST_IMAGE", "custos:ci"), "--config", "/test/config.toml", "run", "--mock-jev")
             for _ in range(50):
                 if docker("exec", engine, "custos", "stats", check=False).returncode == 0:
                     break
@@ -55,7 +62,7 @@ enabled = false
                 raise AssertionError("Custos did not become ready")
             address = docker("inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", engine).stdout.strip()
             tmp.joinpath("nginx.conf").write_text(snippet.replace("127.0.0.1:8085", address + ":8085"))
-            docker("run", "-d", "--name", proxy, "--network", name, "-v",
+            docker("run", "-d", "--name", proxy, "--network", name, "--ip", proxy_address, "-v",
                    f"{tmp / 'nginx.conf'}:/etc/nginx/conf.d/default.conf:ro", "nginx:alpine")
             docker("exec", proxy, "nginx", "-t")
 

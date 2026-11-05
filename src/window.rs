@@ -283,6 +283,15 @@ impl SlidingWindowEngine {
     }
 
     pub(crate) fn ingest_bounded(&self, ev: &AccessLogEvent, oversized: bool) -> L1Disposition {
+        self.ingest_verified_crawler(ev, oversized, false)
+    }
+
+    pub(crate) fn ingest_verified_crawler(
+        &self,
+        ev: &AccessLogEvent,
+        oversized: bool,
+        allowed: bool,
+    ) -> L1Disposition {
         let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
         self.metrics
             .events_processed
@@ -402,6 +411,12 @@ impl SlidingWindowEngine {
             .entry(ev.client_ip)
             .or_insert_with(|| IpWindowState::new(ev.timestamp));
         let win = entry.value_mut();
+        if allowed {
+            win.suspicion_reasons
+                .insert("verified_crawler_allow".into());
+        } else {
+            win.suspicion_reasons.remove("verified_crawler_allow");
+        }
 
         win.last_seen = win.last_seen.max(ev.timestamp);
         win.last_observed = Instant::now();
@@ -663,6 +678,13 @@ impl SlidingWindowEngine {
             self.windows.remove(&ip);
         }
 
+        summaries.retain(|(summary, _)| {
+            !summary
+                .l1_suspicion_reasons
+                .iter()
+                .any(|s| s == "verified_crawler_allow")
+                || crate::evidence::signals_have_exploit(&summary.l1_suspicion_reasons)
+        });
         self.metrics
             .windows_promoted_to_jev
             .fetch_add(summaries.len() as u64, Ordering::Relaxed);

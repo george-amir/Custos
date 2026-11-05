@@ -2,7 +2,10 @@ pub mod analysis;
 pub mod bouncer_api;
 mod cleanup;
 pub mod config;
+pub mod crawlers;
+pub mod evidence;
 pub mod firewall;
+pub mod health;
 pub mod hub;
 #[allow(clippy::all)]
 pub mod hub_proto;
@@ -28,6 +31,31 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{info, warn};
+
+/// Resolve existing ancestors even when the state file has not been created yet.
+/// Reject ambiguous missing-parent traversal instead of risking journal replacement.
+fn storage_path_identity(path: &std::path::Path) -> Result<PathBuf> {
+    let mut existing = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    while !existing.try_exists()? {
+        missing.push(
+            existing
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Storage path requires an unambiguous file name"))?
+                .to_owned(),
+        );
+        anyhow::ensure!(existing.pop(), "Storage path has no existing ancestor");
+    }
+    let mut resolved = existing.canonicalize()?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    // Windows and default macOS volumes compare file names without case. Being
+    // conservative also rejects case-only aliases on case-sensitive volumes.
+    #[cfg(any(windows, target_os = "macos"))]
+    let resolved = PathBuf::from(resolved.to_string_lossy().to_lowercase());
+    Ok(resolved)
+}
 
 /// Ergonomic builder for embedding `Custos` (`SecurityPipeline`) as a Rust library.
 #[derive(Debug, Clone, Default)]
@@ -105,7 +133,14 @@ impl CustosBuilder {
             limits.max_provider_response_bytes,
         )?);
         let firewall = Arc::new(FirewallBouncer::new(self.config.firewall));
-        let mut pipeline = SecurityPipeline::new_with_limits(store, window, jev, firewall, limits)?;
+        let mut pipeline = SecurityPipeline::new_with_crawlers(
+            store,
+            window,
+            jev,
+            firewall,
+            limits,
+            self.config.crawlers,
+        )?;
         pipeline.trusted_proxies = Arc::new(self.config.daemon.trusted_proxies);
         pipeline.on_decision_capacity = self.config.daemon.on_decision_capacity;
         Ok(pipeline)
@@ -136,6 +171,9 @@ impl EventPermit {
 
 #[derive(Clone)]
 pub struct SecurityPipeline {
+    pub crawlers: Arc<crawlers::CrawlerRegistry>,
+    pub health: Arc<health::PipelineHealth>,
+    crawler_mutation: Arc<Mutex<()>>,
     pub store: Arc<DecisionStore>,
     pub window: Arc<SlidingWindowEngine>,
     pub jev: Arc<JevBatchAnalyzer>,
@@ -156,6 +194,86 @@ pub struct SecurityPipeline {
 }
 
 impl SecurityPipeline {
+    /// Policy is durable before cleanup. Failed removals remain in the ban ledger for retry.
+    pub fn set_crawler_policy(&self, id: &str, policy: crawlers::CrawlerPolicy) -> Result<usize> {
+        let _operation = self
+            .crawler_mutation
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("Crawler policy update already in progress"))?;
+        {
+            let _guard = self.enforcement_guard()?;
+            self.crawlers.set_policy(id, policy)?;
+        }
+        let mut removed = 0;
+        let mut errors = Vec::new();
+        if policy != crawlers::CrawlerPolicy::Block {
+            let ips = self.store.active_ips();
+            for group in ips.chunks(self.firewall.cleanup_chunk_size()) {
+                let mut cleanup = Vec::new();
+                {
+                    let _guard = self.enforcement_guard()?;
+                    for ip in group {
+                        let Some(decision) = self.store.check_ip(ip) else {
+                            continue;
+                        };
+                        if self
+                            .crawlers
+                            .identify(*ip)
+                            .is_none_or(|identity| identity.id != id)
+                        {
+                            continue;
+                        }
+                        let relaxable = decision.source == DecisionSource::CrawlerPolicy
+                            || (policy == crawlers::CrawlerPolicy::Allow
+                                && matches!(
+                                    decision.source,
+                                    DecisionSource::JevSystemOne | DecisionSource::L1Deterministic
+                                )
+                                && matches!(
+                                    decision.threat_class.as_str(),
+                                    "vulnerability_scanner" | "api_enumeration_idor"
+                                )
+                                && !decision.evidence.as_ref().is_some_and(|e| e.has_exploit()));
+                        if relaxable {
+                            match self.store.remove_ban(ip) {
+                                Ok(true) => cleanup.push(*ip),
+                                Ok(false) => {}
+                                Err(error) => {
+                                    if errors.len() < 4 {
+                                        errors.push(error.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !cleanup.is_empty() {
+                    match cleanup::cleanup_group(
+                        &self.store,
+                        &self.firewall,
+                        &self.enforcement,
+                        &cleanup,
+                    ) {
+                        Ok(()) => removed += cleanup.len(),
+                        Err(error) => {
+                            if errors.len() < 4 {
+                                errors.push(error.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            self.request_cleanup();
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Crawler policy saved, but cleanup is pending: {}",
+            errors.first().unwrap_or(&String::new())
+        );
+        Ok(removed)
+    }
     pub fn builder() -> CustosBuilder {
         CustosBuilder::new()
     }
@@ -182,9 +300,30 @@ impl SecurityPipeline {
         firewall: Arc<FirewallBouncer>,
         limits: limits::MemoryLimits,
     ) -> Result<Self> {
+        Self::new_with_crawlers(store, window, jev, firewall, limits, Default::default())
+    }
+
+    pub fn new_with_crawlers(
+        store: Arc<DecisionStore>,
+        window: Arc<SlidingWindowEngine>,
+        jev: Arc<JevBatchAnalyzer>,
+        firewall: Arc<FirewallBouncer>,
+        limits: limits::MemoryLimits,
+        config: crawlers::CrawlerConfig,
+    ) -> Result<Self> {
+        let path = store.persistence_path().with_extension("crawlers.json");
+        anyhow::ensure!(
+            storage_path_identity(config.state_file.as_ref().unwrap_or(&path))?
+                != storage_path_identity(store.persistence_path())?,
+            "Crawler state must not overwrite the decision journal"
+        );
+        let crawlers = Arc::new(crawlers::CrawlerRegistry::open(config, Some(path))?);
         limits.validate()?;
         firewall.init_backend()?;
         let mut pipeline = Self {
+            crawlers,
+            health: Arc::new(health::PipelineHealth::default()),
+            crawler_mutation: Arc::new(Mutex::new(())),
             store,
             window,
             jev,
@@ -204,6 +343,7 @@ impl SecurityPipeline {
             ingestion: None,
         };
         pipeline.reconcile_firewall()?;
+        pipeline.firewall.sample_counters();
         pipeline.cleanup = Some(cleanup::CleanupWorker::start(
             pipeline.store.clone(),
             pipeline.firewall.clone(),
@@ -346,7 +486,25 @@ impl SecurityPipeline {
         reason: String,
         ttl: Option<u64>,
     ) -> Result<BanDecision> {
-        let result = self.store.upsert_ban_with_kernel(
+        self.record_ban_with_evidence_locked(
+            ip, threat, source, noul, confidence, reason, ttl, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_ban_with_evidence_locked(
+        &self,
+        ip: IpAddr,
+        threat: String,
+        source: DecisionSource,
+        noul: f64,
+        confidence: f64,
+        reason: String,
+        ttl: Option<u64>,
+        evidence: Option<evidence::DecisionEvidence>,
+    ) -> Result<BanDecision> {
+        let was_active = self.store.check_ip(&ip).is_some();
+        let result = self.store.upsert_ban_with_context(
             ip,
             threat,
             source,
@@ -355,11 +513,19 @@ impl SecurityPipeline {
             reason,
             ttl,
             self.firewall.is_enabled() && !self.firewall.is_dry_run(),
+            evidence,
+            self.crawlers.identify(ip),
         );
         if result.is_err() && self.store.is_at_capacity() {
             self.request_cleanup();
         }
         let decision = result?;
+        if was_active {
+            &self.health.ban_updates
+        } else {
+            &self.health.new_bans
+        }
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(error) = self.firewall.ban_ip(ip, remaining_ttl(&decision)) {
             if let Some(worker) = &self.cleanup {
                 worker.retry_enforcement();
@@ -401,12 +567,12 @@ impl SecurityPipeline {
                 failures.push(error.to_string());
             }
         }
-        let active = self.store.list_active();
+        let active = self.store.active_ips();
         for group in active.chunks(self.firewall.enforcement_chunk_size()) {
             let _guard = self.enforcement_guard()?;
             let entries: Vec<_> = group
                 .iter()
-                .filter_map(|old| self.store.check_ip(&old.ip))
+                .filter_map(|ip| self.store.check_ip(ip))
                 .map(|d| (d.ip, remaining_ttl(&d)))
                 .collect();
             if self.firewall.is_enabled() && !self.firewall.is_dry_run() {
@@ -416,6 +582,11 @@ impl SecurityPipeline {
             }
             if let Err(error) = self.firewall.ban_ips_batch(&entries) {
                 failures.push(error.to_string());
+            } else {
+                self.firewall
+                    .metrics
+                    .ban_refreshes
+                    .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if !failures.is_empty() {
@@ -429,10 +600,54 @@ impl SecurityPipeline {
     }
 
     fn process_event_bounded(&self, ev: &AccessLogEvent, oversized: bool) -> Result<()> {
+        self.health
+            .events_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.store.check_ip(&ev.client_ip).is_some() {
+            self.health
+                .already_banned
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
-        match self.window.ingest_bounded(ev, oversized) {
+        let mut identity = self.crawlers.identify(ev.client_ip);
+        if identity
+            .as_ref()
+            .is_some_and(|identity| identity.policy == crawlers::CrawlerPolicy::Block)
+        {
+            let _guard = self.enforcement_guard()?;
+            // A policy may change while this event waits for kernel enforcement.
+            identity = self.crawlers.identify(ev.client_ip);
+            if identity
+                .as_ref()
+                .is_some_and(|identity| identity.policy == crawlers::CrawlerPolicy::Block)
+            {
+                self.record_ban_with_evidence_locked(
+                    ev.client_ip,
+                    "crawler_policy".into(),
+                    DecisionSource::CrawlerPolicy,
+                    0.0,
+                    0.0,
+                    format!(
+                        "Operator blocked verified crawler {}",
+                        identity.as_ref().unwrap().id
+                    ),
+                    None,
+                    Some(evidence::DecisionEvidence::from_event(
+                        ev,
+                        "crawler_policy_block",
+                    )),
+                )?;
+                return Ok(());
+            }
+        }
+        let allowed =
+            identity.is_some_and(|identity| identity.policy == crawlers::CrawlerPolicy::Allow);
+        if allowed {
+            self.health
+                .observed_crawler_allowed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        match self.window.ingest_verified_crawler(ev, oversized, allowed) {
             L1Disposition::IgnoredStatic
             | L1Disposition::Buffered { .. }
             | L1Disposition::Throttled { .. } => {}
@@ -446,15 +661,47 @@ impl SecurityPipeline {
                 } else {
                     DecisionSource::L1Deterministic
                 };
-                self.record_ban(ev.client_ip, threat_class, source, 1.0, 1.0, reason, None)?;
+                let _guard = self.enforcement_guard()?;
+                let signal = if source == DecisionSource::L1AutoSignature {
+                    "cached_exploit_signature"
+                } else {
+                    "strict_volume_opt_in"
+                };
+                self.record_ban_with_evidence_locked(
+                    ev.client_ip,
+                    threat_class,
+                    source,
+                    1.0,
+                    1.0,
+                    reason,
+                    None,
+                    Some(evidence::DecisionEvidence::from_event(ev, signal)),
+                )?;
             }
         }
         Ok(())
     }
 
-    fn apply_verdict(&self, v: &ActorVerdict, expires: std::time::Instant) -> Result<()> {
+    fn apply_verdict(
+        &self,
+        v: &ActorVerdict,
+        expires: std::time::Instant,
+        evidence: evidence::DecisionEvidence,
+    ) -> Result<bool> {
+        let _policy_guard = self
+            .crawler_mutation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Crawler mutation lock poisoned"))?;
         if !v.should_ban {
-            return Ok(());
+            return Ok(false);
+        }
+        if self
+            .crawlers
+            .identify(v.client_ip)
+            .is_some_and(|identity| identity.policy == crawlers::CrawlerPolicy::Allow)
+            && !evidence.has_exploit()
+        {
+            return Ok(false);
         }
         anyhow::ensure!(
             std::time::Instant::now() < expires,
@@ -487,7 +734,7 @@ impl SecurityPipeline {
                 return Err(error);
             }
         } else {
-            self.record_ban_locked(
+            self.record_ban_with_evidence_locked(
                 v.client_ip,
                 v.threat_class.clone(),
                 DecisionSource::JevSystemOne,
@@ -498,9 +745,10 @@ impl SecurityPipeline {
                     v.threat_class, v.noul_malicious_prob, v.choice_confidence
                 ),
                 None,
+                Some(evidence),
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Analyze bounded fresh and retry work fairly. Forced flushing bypasses retry
@@ -574,7 +822,7 @@ impl SecurityPipeline {
             };
             let mut apply_ids = Vec::new();
             let mut apply = Vec::new();
-            for (id, verdict) in ids.iter().zip(verdicts) {
+            for (id, mut verdict) in ids.iter().zip(verdicts) {
                 let item = pending
                     .items
                     .iter_mut()
@@ -583,22 +831,39 @@ impl SecurityPipeline {
                 if item.expires <= std::time::Instant::now() {
                     continue;
                 }
+                let evidence = evidence::DecisionEvidence::from_summary(&item.summary);
+                if self
+                    .crawlers
+                    .identify(verdict.client_ip)
+                    .is_some_and(|identity| identity.policy == crawlers::CrawlerPolicy::Allow)
+                    && !evidence.has_exploit()
+                {
+                    verdict.should_ban = false;
+                    verdict.recommend_auto_signature = false;
+                }
                 item.verdict = Some(verdict.clone());
                 apply_ids.push(*id);
-                apply.push((verdict, item.expires));
+                apply.push((verdict, item.expires, evidence));
             }
             let worker = self.clone();
             let permit = work_permit.take().expect("analysis work permit");
             let (results, permit) = tokio::task::spawn_blocking(move || {
                 let results = apply
                     .into_iter()
-                    .map(|(verdict, expires)| {
+                    .map(|(mut verdict, expires, evidence)| {
                         let result = if std::time::Instant::now() >= expires {
                             Err(anyhow::anyhow!(
                                 "Analysis evidence expired before application"
                             ))
                         } else {
-                            worker.apply_verdict(&verdict, expires)
+                            worker
+                                .apply_verdict(&verdict, expires, evidence)
+                                .map(|applied| {
+                                    if !applied {
+                                        verdict.should_ban = false;
+                                        verdict.recommend_auto_signature = false;
+                                    }
+                                })
                         };
                         (verdict, result)
                     })
@@ -610,6 +875,32 @@ impl SecurityPipeline {
             for (id, (verdict, result)) in apply_ids.into_iter().zip(results) {
                 match result {
                     Ok(()) => {
+                        let latency = self
+                            .limits
+                            .analysis_ttl_secs
+                            .saturating_mul(1000)
+                            .saturating_sub(
+                                pending
+                                    .items
+                                    .iter()
+                                    .find(|item| item.id == id)
+                                    .map(|item| {
+                                        item.expires
+                                            .saturating_duration_since(std::time::Instant::now())
+                                            .as_millis()
+                                            as u64
+                                    })
+                                    .unwrap_or(0),
+                            );
+                        self.health
+                            .analysis_completed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.health
+                            .analysis_latency_ms_total
+                            .fetch_add(latency, std::sync::atomic::Ordering::Relaxed);
+                        self.health
+                            .analysis_latency_ms_max
+                            .fetch_max(latency, std::sync::atomic::Ordering::Relaxed);
                         pending.remove(id);
                         completed.push(verdict);
                     }

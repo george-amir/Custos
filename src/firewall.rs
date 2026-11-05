@@ -1,7 +1,7 @@
 use crate::config::FirewallConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,12 +103,63 @@ impl FirewallCommandSpec {
 /// a real OS firewall; production runners must honor the supplied deadline.
 pub trait FirewallCommandRunner: Send + Sync {
     fn run(&self, command: &FirewallCommandSpec, timeout: Duration) -> Result<i32>;
+    fn read_output(
+        &self,
+        _command: &FirewallCommandSpec,
+        _timeout: Duration,
+        _limit: usize,
+    ) -> Result<Vec<u8>> {
+        bail!("Counter collection is unavailable for this runner")
+    }
 }
 
 #[derive(Default)]
 pub struct ProcessFirewallCommandRunner;
 
 impl FirewallCommandRunner for ProcessFirewallCommandRunner {
+    fn read_output(
+        &self,
+        command: &FirewallCommandSpec,
+        timeout: Duration,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let mut child = Command::new(&command.program)
+            .args(&command.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let output = child.stdout.take().context("Missing counter output")?;
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            output
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        });
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                other => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(anyhow!("Counter command failed or timed out: {other:?}"));
+                }
+            }
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| anyhow!("Counter reader panicked"))??;
+        anyhow::ensure!(
+            status?.success() && bytes.len() <= limit,
+            "Counter output failed or exceeded byte budget"
+        );
+        Ok(bytes)
+    }
     fn run(&self, command: &FirewallCommandSpec, timeout: Duration) -> Result<i32> {
         let mut child = Command::new(&command.program)
             .args(&command.args)
@@ -162,9 +213,18 @@ impl FirewallCommandRunner for ProcessFirewallCommandRunner {
 
 #[derive(Debug, Default)]
 pub struct FirewallMetrics {
+    pub ban_refreshes: AtomicU64,
     pub rules_applied: AtomicU64,
     pub rules_removed: AtomicU64,
     pub command_errors: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelCounters {
+    pub sampled_at: chrono::DateTime<chrono::Utc>,
+    pub dropped_packets: u64,
+    pub dropped_bytes: u64,
+    pub hooks: Vec<String>,
 }
 
 /// Only complete, successful groups are confirmed. A partially applied ipset
@@ -178,6 +238,7 @@ pub struct UnbanBatchResult {
 /// Cross-platform OS firewall bouncer that translates IP ban/unban decisions into
 /// native kernel firewall commands (`nft`, `ipset`, `pfctl`, or `netsh`).
 pub struct FirewallBouncer {
+    counters: Mutex<Option<KernelCounters>>,
     cfg: FirewallConfig,
     resolved_backend: FirewallBackend,
     recent_commands: Mutex<Vec<String>>,
@@ -203,6 +264,7 @@ impl FirewallBouncer {
     ) -> Self {
         let resolved_backend = cfg.backend.resolve();
         Self {
+            counters: Mutex::new(None),
             cfg,
             resolved_backend,
             recent_commands: Mutex::new(Vec::new()),
@@ -215,6 +277,89 @@ impl FirewallBouncer {
 
     pub fn resolved_backend(&self) -> FirewallBackend {
         self.resolved_backend
+    }
+
+    pub fn kernel_counters(&self) -> Option<KernelCounters> {
+        self.counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Read only managed chains, off the request path, with a deadline and byte cap.
+    /// Missing counters remain unavailable instead of reporting a misleading zero.
+    pub fn sample_counters(&self) {
+        if !self.cfg.enabled
+            || self.cfg.dry_run
+            || self.resolved_backend != FirewallBackend::Nftables
+        {
+            return;
+        }
+        let result = (|| -> Result<KernelCounters> {
+            let hooks = if self.cfg.protect_docker {
+                vec!["input", "docker_forward"]
+            } else {
+                vec!["input"]
+            };
+            let mut packets = 0u64;
+            let mut bytes = 0u64;
+            for hook in &hooks {
+                let output = self.runner.read_output(
+                    &FirewallCommandSpec::new(
+                        "nft",
+                        ["-j", "list", "chain", "inet", &self.cfg.table_name, hook],
+                    ),
+                    Duration::from_secs(1),
+                    64 * 1024,
+                )?;
+                anyhow::ensure!(
+                    output.len() <= 64 * 1024,
+                    "Counter output exceeds byte budget"
+                );
+                let value: serde_json::Value = serde_json::from_slice(&output)?;
+                let mut families = std::collections::BTreeSet::new();
+                for rule in value["nftables"]
+                    .as_array()
+                    .context("Invalid nft counters")?
+                {
+                    let Some(expressions) = rule["rule"]["expr"].as_array() else {
+                        continue;
+                    };
+                    let family = expressions.iter().find_map(|e| {
+                        e["match"]["right"]
+                            .as_str()
+                            .filter(|set| matches!(*set, "@block_v4" | "@block_v6"))
+                    });
+                    if let Some(family) =
+                        family.filter(|_| expressions.iter().any(|e| e.get("drop").is_some()))
+                    {
+                        let counter = expressions
+                            .iter()
+                            .find_map(|e| e.get("counter"))
+                            .context("Missing managed counter")?;
+                        packets = packets
+                            .checked_add(
+                                counter["packets"]
+                                    .as_u64()
+                                    .context("Invalid packet counter")?,
+                            )
+                            .context("Packet counter overflow")?;
+                        bytes = bytes
+                            .checked_add(counter["bytes"].as_u64().context("Invalid byte counter")?)
+                            .context("Byte counter overflow")?;
+                        families.insert(family);
+                    }
+                }
+                anyhow::ensure!(families.len() == 2, "Managed IPv4/IPv6 drop rules missing");
+            }
+            Ok(KernelCounters {
+                sampled_at: chrono::Utc::now(),
+                dropped_packets: packets,
+                dropped_bytes: bytes,
+                hooks: hooks.into_iter().map(str::to_owned).collect(),
+            })
+        })();
+        *self.counters.lock().unwrap_or_else(|e| e.into_inner()) = result.ok();
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -237,6 +382,10 @@ impl FirewallBouncer {
         if !self.cfg.enabled {
             return Ok(Vec::new());
         }
+        anyhow::ensure!(
+            !self.cfg.protect_docker || self.resolved_backend == FirewallBackend::Nftables,
+            "firewall.protect_docker currently requires the nftables backend"
+        );
         if self.cfg.table_name.is_empty()
             || !self
                 .cfg
@@ -492,71 +641,125 @@ impl FirewallBouncer {
     pub fn build_init_commands(&self) -> Vec<FirewallCommandSpec> {
         let table = &self.cfg.table_name;
         match self.resolved_backend {
-            FirewallBackend::Nftables => vec![
-                FirewallCommandSpec::new("nft", ["add", "table", "inet", table]),
-                FirewallCommandSpec::new(
-                    "nft",
-                    [
-                        "add",
-                        "set",
-                        "inet",
-                        table,
-                        "block_v4",
-                        "{ type ipv4_addr; flags timeout; }",
-                    ],
-                ),
-                FirewallCommandSpec::new(
-                    "nft",
-                    [
-                        "add",
-                        "set",
-                        "inet",
-                        table,
-                        "block_v6",
-                        "{ type ipv6_addr; flags timeout; }",
-                    ],
-                ),
-                FirewallCommandSpec::new(
-                    "nft",
-                    [
-                        "add",
-                        "chain",
-                        "inet",
-                        table,
-                        "input",
-                        "{ type filter hook input priority -10; policy accept; }",
-                    ],
-                ),
-                FirewallCommandSpec::new("nft", ["flush", "chain", "inet", table, "input"]),
-                FirewallCommandSpec::new(
-                    "nft",
-                    [
-                        "add",
-                        "rule",
-                        "inet",
-                        table,
-                        "input",
-                        "ip",
-                        "saddr",
-                        "@block_v4",
-                        "drop",
-                    ],
-                ),
-                FirewallCommandSpec::new(
-                    "nft",
-                    [
-                        "add",
-                        "rule",
-                        "inet",
-                        table,
-                        "input",
-                        "ip6",
-                        "saddr",
-                        "@block_v6",
-                        "drop",
-                    ],
-                ),
-            ],
+            FirewallBackend::Nftables => {
+                let mut commands = vec![
+                    FirewallCommandSpec::new("nft", ["add", "table", "inet", table]),
+                    FirewallCommandSpec::new(
+                        "nft",
+                        [
+                            "add",
+                            "set",
+                            "inet",
+                            table,
+                            "block_v4",
+                            "{ type ipv4_addr; flags timeout; }",
+                        ],
+                    ),
+                    FirewallCommandSpec::new(
+                        "nft",
+                        [
+                            "add",
+                            "set",
+                            "inet",
+                            table,
+                            "block_v6",
+                            "{ type ipv6_addr; flags timeout; }",
+                        ],
+                    ),
+                    FirewallCommandSpec::new(
+                        "nft",
+                        [
+                            "add",
+                            "chain",
+                            "inet",
+                            table,
+                            "input",
+                            "{ type filter hook input priority -10; policy accept; }",
+                        ],
+                    ),
+                    FirewallCommandSpec::new("nft", ["flush", "chain", "inet", table, "input"]),
+                    FirewallCommandSpec::new(
+                        "nft",
+                        [
+                            "add",
+                            "rule",
+                            "inet",
+                            table,
+                            "input",
+                            "ip",
+                            "saddr",
+                            "@block_v4",
+                            "counter",
+                            "drop",
+                        ],
+                    ),
+                    FirewallCommandSpec::new(
+                        "nft",
+                        [
+                            "add",
+                            "rule",
+                            "inet",
+                            table,
+                            "input",
+                            "ip6",
+                            "saddr",
+                            "@block_v6",
+                            "counter",
+                            "drop",
+                        ],
+                    ),
+                ];
+                if self.cfg.protect_docker {
+                    commands.extend([
+                        FirewallCommandSpec::new(
+                            "nft",
+                            [
+                                "add",
+                                "chain",
+                                "inet",
+                                table,
+                                "docker_forward",
+                                "{ type filter hook forward priority -10; policy accept; }",
+                            ],
+                        ),
+                        FirewallCommandSpec::new(
+                            "nft",
+                            ["flush", "chain", "inet", table, "docker_forward"],
+                        ),
+                        FirewallCommandSpec::new(
+                            "nft",
+                            [
+                                "add",
+                                "rule",
+                                "inet",
+                                table,
+                                "docker_forward",
+                                "ip",
+                                "saddr",
+                                "@block_v4",
+                                "counter",
+                                "drop",
+                            ],
+                        ),
+                        FirewallCommandSpec::new(
+                            "nft",
+                            [
+                                "add",
+                                "rule",
+                                "inet",
+                                table,
+                                "docker_forward",
+                                "ip6",
+                                "saddr",
+                                "@block_v6",
+                                "counter",
+                                "drop",
+                            ],
+                        ),
+                    ]);
+                }
+                commands
+            }
             FirewallBackend::Ipset => vec![
                 FirewallCommandSpec::new(
                     "ipset",
@@ -783,6 +986,7 @@ mod tests {
 
     fn test_cfg(backend: FirewallBackend) -> FirewallConfig {
         FirewallConfig {
+            protect_docker: false,
             enabled: true,
             backend,
             dry_run: true,

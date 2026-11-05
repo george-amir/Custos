@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionSource {
+    CrawlerPolicy,
     L1Deterministic,
     L1AutoSignature,
     JevSystemOne,
@@ -23,6 +24,10 @@ pub enum DecisionSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BanDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::evidence::DecisionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crawler: Option<crate::crawlers::VerifiedCrawler>,
     pub ip: IpAddr,
     pub threat_class: String,
     pub source: DecisionSource,
@@ -42,6 +47,20 @@ fn default_kernel_cleanup_required() -> bool {
 }
 
 impl BanDecision {
+    fn validate_audit(&self) -> Result<()> {
+        if let Some(evidence) = &self.evidence {
+            evidence.validate()?;
+        }
+        if let Some(crawler) = &self.crawler {
+            anyhow::ensure!(
+                crawler.id.len() <= 64
+                    && crawler.name.len() <= 96
+                    && crawler.matched_prefix.len() <= 64,
+                "Crawler evidence exceeds budget"
+            );
+        }
+        Ok(())
+    }
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         now >= self.expires_at
     }
@@ -129,6 +148,7 @@ impl DecisionStore {
             // Existing JSONL BanDecision records remain backwards compatible.
             if let Ok(decision) = serde_json::from_str::<BanDecision>(line) {
                 self.validate_metadata(&decision.threat_class, &decision.reason)?;
+                decision.validate_audit()?;
                 self.admit(&decision.ip)?;
                 self.pending_cleanup.remove(&decision.ip);
                 self.active_bans.insert(decision.ip, decision);
@@ -201,6 +221,38 @@ impl DecisionStore {
         custom_ttl_secs: Option<u64>,
         kernel_cleanup_required: bool,
     ) -> Result<BanDecision> {
+        self.upsert_ban_with_context(
+            ip,
+            threat_class,
+            source,
+            noul_probability,
+            confidence,
+            reason,
+            custom_ttl_secs,
+            kernel_cleanup_required,
+            None,
+            None,
+        )
+    }
+
+    pub fn persistence_path(&self) -> &Path {
+        &self.persistence_path
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_ban_with_context(
+        &self,
+        ip: IpAddr,
+        threat_class: String,
+        source: DecisionSource,
+        noul_probability: f64,
+        confidence: f64,
+        reason: String,
+        custom_ttl_secs: Option<u64>,
+        kernel_cleanup_required: bool,
+        evidence: Option<crate::evidence::DecisionEvidence>,
+        crawler: Option<crate::crawlers::VerifiedCrawler>,
+    ) -> Result<BanDecision> {
         self.validate_metadata(&threat_class, &reason)?;
         let now = Utc::now();
         let ttl = custom_ttl_secs.unwrap_or(self.default_ttl_secs).max(1);
@@ -209,6 +261,8 @@ impl DecisionStore {
             .and_then(Duration::try_seconds)
             .ok_or_else(|| anyhow!("Ban TTL is out of range"))?;
         let mut decision = BanDecision {
+            evidence,
+            crawler,
             ip,
             threat_class,
             source,
@@ -221,6 +275,7 @@ impl DecisionStore {
                 .ok_or_else(|| anyhow!("Ban expiry is out of range"))?,
             kernel_cleanup_required,
         };
+        decision.validate_audit()?;
         let _guard = self
             .mutation_lock
             .lock()
@@ -327,6 +382,40 @@ impl DecisionStore {
             .collect();
         list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         list
+    }
+
+    /// Public summaries must not copy private evidence into every list response.
+    pub fn list_active_summaries(&self) -> Vec<BanDecision> {
+        let now = Utc::now();
+        let mut list: Vec<_> = self
+            .active_bans
+            .iter()
+            .filter(|entry| !entry.is_expired(now))
+            .map(|entry| BanDecision {
+                ip: entry.ip,
+                threat_class: entry.threat_class.clone(),
+                source: entry.source.clone(),
+                noul_probability: entry.noul_probability,
+                confidence: entry.confidence,
+                reason: entry.reason.clone(),
+                created_at: entry.created_at,
+                expires_at: entry.expires_at,
+                kernel_cleanup_required: entry.kernel_cleanup_required,
+                evidence: None,
+                crawler: None,
+            })
+            .collect();
+        list.sort_by_key(|decision| std::cmp::Reverse(decision.created_at));
+        list
+    }
+
+    pub fn active_ips(&self) -> Vec<IpAddr> {
+        let now = Utc::now();
+        self.active_bans
+            .iter()
+            .filter(|entry| !entry.is_expired(now))
+            .map(|entry| entry.ip)
+            .collect()
     }
 
     pub fn active_count(&self) -> usize {

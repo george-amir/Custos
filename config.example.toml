@@ -1,4 +1,4 @@
-# Custos v0.4 Example Configuration
+# Custos v0.5 Example Configuration
 
 [daemon]
 bouncer_listen = "127.0.0.1:8085"
@@ -7,12 +7,12 @@ default_ban_ttl_secs = 3600
 # Keep existing bans/signatures enforced while allowing unbanned clients at ledger capacity.
 # Choose "fail_closed" for the strict HTTP 503 policy. Other admission limits still apply.
 on_decision_capacity = "enforce_existing"
-# Bearer token required for mutating API endpoints (POST/DELETE /v1/decisions).
+# Bearer token required for administrative mutations and private evidence/log-health reads.
 # Empty disables admin mutations (503); read-only bouncer checks remain available.
 # Can also be set via CUSTOS_API_TOKEN environment variable
 api_token = ""
-# Embedded middleware only: exact socket peers permitted to supply forwarded IPs.
-# Forwarding headers from other peers are ignored.
+# Exact proxy socket peers allowed by embedded middleware and the standalone checker.
+# Standalone checks also accept loopback and authenticated administrative diagnostics.
 trusted_proxies = []
 
 [[logs]]
@@ -68,6 +68,8 @@ auto_signature_confidence_threshold = 0.92
 timeout_ms = 5000
 
 [firewall]
+# nftables only: also enforce bans on forwarded Docker traffic. Opt in on Linux.
+protect_docker = false
 # Enable OS-level packet filtering bouncer alongside the HTTP Bouncer API
 enabled = true
 # Cross-platform backend: "auto" | "nftables" | "ipset" | "pf" | "windows_netsh"
@@ -122,3 +124,17 @@ hub_max_pending_signatures = 256
 # Effective reporter quota is also capped at half its candidate budget, rounded up.
 hub_max_pending_per_node = 1000
 hub_vote_ttl_secs = 60
+
+[crawlers]
+# Only publisher-verified IP ranges identify a service. User-Agent is never trusted.
+auto_refresh = true
+refresh_interval_secs = 86400
+max_feed_age_secs = 604800
+# Defaults to a private sibling of daemon.decisions_file. Runtime choices persist here
+# and override the initial policies below. Keep it when upgrading or restarting.
+# state_file = "/var/lib/custos/decisions.crawlers.json"
+
+# Omitted services default to "normal". Valid choices: "normal", "allow", "block".
+# [crawlers.policies]
+# nokia_genome = "block"
+# googlebot = "allow"

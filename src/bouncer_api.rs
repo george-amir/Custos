@@ -21,6 +21,15 @@ impl std::ops::Deref for AppState {
     }
 }
 
+fn authorized_admin(headers: &HeaderMap, token: &str) -> bool {
+    !token.is_empty()
+        && headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .is_some_and(|supplied| supplied == token)
+}
+
 async fn require_admin(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -33,12 +42,7 @@ async fn require_admin(
         )
             .into_response();
     }
-    let authorized = request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|token| token == state.api_token);
+    let authorized = authorized_admin(request.headers(), &state.api_token);
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -83,6 +87,48 @@ fn default_manual_reason() -> String {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatsResponse {
+    #[serde(default)]
+    pub queue_rejected: u64,
+    #[serde(default)]
+    pub decision_capacity_rejected: u64,
+    #[serde(default)]
+    pub decision_saturated: bool,
+    #[serde(default)]
+    pub retained_decisions: usize,
+    #[serde(default)]
+    pub analysis_retried: u64,
+    pub kernel_dropped_packets: Option<u64>,
+    pub kernel_dropped_bytes: Option<u64>,
+    pub kernel_counters_sampled_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub uptime_secs: u64,
+    pub process_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub events_received: u64,
+    #[serde(default)]
+    pub events_already_banned: u64,
+    #[serde(default)]
+    pub new_ban_decisions: u64,
+    #[serde(default)]
+    pub ban_decision_updates: u64,
+    #[serde(default)]
+    pub firewall_ban_refreshes: u64,
+    #[serde(default)]
+    pub pending_cleanup: usize,
+    #[serde(default)]
+    pub analysis_pending_actors: usize,
+    #[serde(default)]
+    pub analysis_pending_bytes: usize,
+    #[serde(default)]
+    pub analysis_expired: u64,
+    #[serde(default)]
+    pub analysis_capacity_dropped: u64,
+    #[serde(default)]
+    pub analysis_latency_ms_average: f64,
+    #[serde(default)]
+    pub analysis_latency_ms_max: u64,
+    #[serde(default)]
+    pub log_source_count: usize,
     pub events_processed: u64,
     pub static_ignored: u64,
     pub l1_instant_bans: u64,
@@ -103,6 +149,7 @@ pub struct StatsResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FirewallStatusResponse {
+    pub kernel_counters: Option<crate::firewall::KernelCounters>,
     pub enabled: bool,
     pub resolved_backend: String,
     pub dry_run: bool,
@@ -113,6 +160,26 @@ pub struct FirewallStatusResponse {
 }
 
 pub fn build_bouncer_router(state: AppState) -> Router {
+    // Every crawler mutation uses the same bearer-token middleware as manual bans.
+    // An empty admin token disables these routes; unauthenticated requests cannot
+    // persist policies, refresh trust data, or revoke bans.
+    let crawler_mutations = Router::new()
+        .route(
+            "/v1/crawlers/{id}",
+            axum::routing::put(handle_crawler_policy),
+        )
+        .route(
+            "/v1/crawlers/refresh",
+            axum::routing::post(handle_crawler_refresh),
+        )
+        // Detailed request evidence is an admin-only read, never a public response.
+        .route("/v1/decisions/{ip}/evidence", get(handle_decision_evidence))
+        .route("/v1/logs", get(handle_log_health))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(4096));
     let mutations = Router::new()
         .route("/v1/decisions", axum::routing::post(handle_create_decision))
         .route("/v1/decisions/{ip}", delete(handle_delete_decision))
@@ -120,17 +187,25 @@ pub fn build_bouncer_router(state: AppState) -> Router {
             state.clone(),
             require_admin,
         ));
-    let requests = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let bouncer_requests = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let management_requests = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     Router::new()
         .route("/v1/bouncer/check", get(handle_bouncer_check))
         .route("/v1/decisions", get(handle_list_decisions))
         .route("/v1/firewall", get(handle_firewall_status))
         .route("/v1/stats", get(handle_stats))
+        .route("/v1/crawlers", get(handle_crawlers))
+        .route("/v1/crawlers/identify", get(handle_identify_crawler))
         .route("/metrics", get(handle_prometheus_metrics))
         .merge(mutations)
+        .merge(crawler_mutations)
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let requests = requests.clone();
+                let requests = if request.uri().path() == "/v1/bouncer/check" {
+                    bouncer_requests.clone()
+                } else {
+                    management_requests.clone()
+                };
                 async move {
                     let Ok(permit) = requests.try_acquire_owned() else {
                         return (
@@ -160,12 +235,52 @@ pub fn build_bouncer_router(state: AppState) -> Router {
 /// Traefik `ForwardAuth`, or custom firewall bouncers.
 async fn handle_bouncer_check(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     Query(query): Query<CheckQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if peer.is_some_and(|axum::Extension(axum::extract::ConnectInfo(peer))| {
+        let ip = match peer.ip() {
+            std::net::IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(ip)),
+            ip => ip,
+        };
+        !ip.is_loopback() && !state.trusted_proxies.contains(&ip)
+    }) && !authorized_admin(&headers, &state.api_token)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            Json(BouncerCheckResponse {
+                ip: String::new(),
+                action: "error_untrusted_proxy".into(),
+                threat_class: None,
+                reason: Some(
+                    "Checker requires loopback, a configured trusted proxy, or an admin token"
+                        .into(),
+                ),
+                noul_probability: None,
+            }),
+        );
+    }
+    let forwarded_ip = || {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_owned())
+    };
     let raw_ip = query
         .ip
         .clone()
+        .or_else(|| {
+            headers
+                .contains_key("x-forwarded-uri")
+                .then(forwarded_ip)
+                .flatten()
+        })
         .or_else(|| {
             headers
                 .get("x-real-ip")
@@ -223,6 +338,22 @@ async fn handle_bouncer_check(
                 threat_class: Some(decision.threat_class),
                 reason: Some(decision.reason),
                 noul_probability: Some(decision.noul_probability),
+            }),
+        )
+    } else if let Some(identity) = state
+        .crawlers
+        .identify(ip)
+        .filter(|identity| identity.policy == crate::crawlers::CrawlerPolicy::Block)
+    {
+        (
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            Json(BouncerCheckResponse {
+                ip: ip.to_string(),
+                action: "block".into(),
+                threat_class: Some("crawler_policy".into()),
+                reason: Some(format!("Operator blocked verified crawler {}", identity.id)),
+                noul_probability: None,
             }),
         )
     } else if let Some(threat) = original_request_signature(&state, &query, &headers) {
@@ -311,8 +442,25 @@ fn original_request_signature(
             .transpose()
     };
     let metadata = (|| -> Result<Option<(String, axum::http::Uri)>, ()> {
-        let method = header("x-original-method")?.or(query.method.as_deref());
-        let uri = header("x-original-uri")?.or(query.uri.as_deref());
+        let original_method = header("x-original-method")?;
+        let forwarded_method = header("x-forwarded-method")?;
+        let original_uri = header("x-original-uri")?;
+        let forwarded_uri = header("x-forwarded-uri")?;
+        for values in [
+            [original_method, forwarded_method],
+            [original_uri, forwarded_uri],
+        ] {
+            let mut present = values.into_iter().flatten();
+            if let Some(first) = present.next()
+                && present.any(|other| other != first)
+            {
+                return Err(());
+            }
+        }
+        let method = original_method
+            .or(forwarded_method)
+            .or(query.method.as_deref());
+        let uri = original_uri.or(forwarded_uri).or(query.uri.as_deref());
         let (method, uri) = match (method, uri) {
             (None, None) => return Ok(None),
             (Some(method), Some(uri)) => (method, uri),
@@ -338,8 +486,98 @@ fn original_request_signature(
     }
 }
 
-async fn handle_list_decisions(State(state): State<AppState>) -> Json<Vec<BanDecision>> {
-    Json(state.store.list_active())
+async fn handle_list_decisions(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
+    Json(
+        state
+            .store
+            .list_active_summaries()
+            .into_iter()
+            .map(|decision| {
+                let mut value = serde_json::to_value(&decision).expect("serializable decision");
+                let public = value.as_object_mut().expect("decision object");
+                public.remove("evidence");
+                public.remove("crawler");
+                let model_decision = decision.source == DecisionSource::JevSystemOne;
+                public.insert(
+                    "maliciousness_score".into(),
+                    if model_decision {
+                        decision.noul_probability.into()
+                    } else {
+                        serde_json::Value::Null
+                    },
+                );
+                public.insert(
+                    "threat_class_confidence".into(),
+                    if model_decision {
+                        decision.confidence.into()
+                    } else {
+                        serde_json::Value::Null
+                    },
+                );
+                value
+            })
+            .collect(),
+    )
+}
+
+async fn handle_decision_evidence(
+    State(state): State<AppState>,
+    Path(ip): Path<std::net::IpAddr>,
+) -> axum::response::Response {
+    match state.store.check_ip(&ip) {
+        Some(decision) => Json(decision).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn handle_log_health(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::health::SourceStatus>> {
+    Json(state.health.sources())
+}
+
+async fn handle_crawlers(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::crawlers::CrawlerStatus>> {
+    Json(state.crawlers.list())
+}
+
+#[derive(Deserialize)]
+struct CrawlerLookup {
+    ip: std::net::IpAddr,
+}
+async fn handle_identify_crawler(
+    State(state): State<AppState>,
+    Query(query): Query<CrawlerLookup>,
+) -> Json<Option<crate::crawlers::VerifiedCrawler>> {
+    Json(state.crawlers.identify(query.ip))
+}
+
+#[derive(Deserialize)]
+struct CrawlerPolicyRequest {
+    policy: crate::crawlers::CrawlerPolicy,
+}
+async fn handle_crawler_policy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CrawlerPolicyRequest>,
+) -> axum::response::Response {
+    if !crate::crawlers::CATALOG.iter().any(|entry| entry.id == id) {
+        return (StatusCode::NOT_FOUND, "Unknown crawler identity").into_response();
+    }
+    let pipeline = state.pipeline.clone();
+    match tokio::task::spawn_blocking(move || pipeline.set_crawler_policy(&id, request.policy)).await {
+        Ok(Ok(removed)) => Json(serde_json::json!({"saved":true, "automatic_bans_removed":removed, "cleanup_pending":state.store.sweep_expired().len()})).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn handle_crawler_refresh(State(state): State<AppState>) -> axum::response::Response {
+    match state.crawlers.refresh().await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
 }
 
 async fn handle_create_decision(
@@ -398,6 +636,7 @@ async fn handle_delete_decision(
 
 async fn handle_firewall_status(State(state): State<AppState>) -> Json<FirewallStatusResponse> {
     Json(FirewallStatusResponse {
+        kernel_counters: state.firewall.kernel_counters(),
         enabled: state.firewall.is_enabled(),
         resolved_backend: state.firewall.resolved_backend().as_str().to_string(),
         dry_run: state.firewall.is_dry_run(),
@@ -413,6 +652,7 @@ async fn handle_firewall_status(State(state): State<AppState>) -> Json<FirewallS
 }
 
 async fn handle_stats(State(state): State<AppState>) -> Json<StatsResponse> {
+    let counters = state.firewall.kernel_counters();
     let input_tokens = state.jev.metrics.input_tokens_total.load(Ordering::Relaxed);
     let output_tokens = state
         .jev
@@ -422,6 +662,43 @@ async fn handle_stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let estimated_cost_usd = (input_tokens as f64 / 1_000_000.0) * 0.042;
 
     Json(StatsResponse {
+        queue_rejected: state.queue_rejected.load(Ordering::Relaxed),
+        decision_capacity_rejected: state.store.capacity_rejected.load(Ordering::Relaxed),
+        decision_saturated: state.store.is_at_capacity(),
+        retained_decisions: state.store.retained_count(),
+        analysis_retried: state.analysis_metrics.retried.load(Ordering::Relaxed),
+        kernel_dropped_packets: counters.as_ref().map(|c| c.dropped_packets),
+        kernel_dropped_bytes: counters.as_ref().map(|c| c.dropped_bytes),
+        kernel_counters_sampled_at: counters.map(|c| c.sampled_at),
+        uptime_secs: state.health.uptime_secs(),
+        process_started_at: Some(state.health.started_at),
+        events_received: state.health.events_received.load(Ordering::Relaxed),
+        events_already_banned: state.health.already_banned.load(Ordering::Relaxed),
+        new_ban_decisions: state.health.new_bans.load(Ordering::Relaxed),
+        ban_decision_updates: state.health.ban_updates.load(Ordering::Relaxed),
+        firewall_ban_refreshes: state.firewall.metrics.ban_refreshes.load(Ordering::Relaxed),
+        pending_cleanup: state.store.sweep_expired().len(),
+        analysis_pending_actors: state
+            .analysis_metrics
+            .pending_actors
+            .load(Ordering::Relaxed),
+        analysis_pending_bytes: state.analysis_metrics.pending_bytes.load(Ordering::Relaxed),
+        analysis_expired: state.analysis_metrics.expired.load(Ordering::Relaxed),
+        analysis_capacity_dropped: state
+            .analysis_metrics
+            .capacity_dropped
+            .load(Ordering::Relaxed),
+        analysis_latency_ms_average: state
+            .health
+            .analysis_latency_ms_total
+            .load(Ordering::Relaxed) as f64
+            / state
+                .health
+                .analysis_completed
+                .load(Ordering::Relaxed)
+                .max(1) as f64,
+        analysis_latency_ms_max: state.health.analysis_latency_ms_max.load(Ordering::Relaxed),
+        log_source_count: state.health.source_count(),
         events_processed: state
             .window
             .metrics
@@ -589,6 +866,36 @@ async fn handle_prometheus_metrics(State(state): State<AppState>) -> impl IntoRe
          # TYPE custos_analysis_retried_total counter\n\
          custos_analysis_retried_total {analysis_retried}\n"
     );
+
+    let mut body = body;
+    body.push_str(&format!(
+        "# TYPE custos_uptime_seconds gauge\ncustos_uptime_seconds {}\n\
+         # TYPE custos_events_received_total counter\ncustos_events_received_total {}\n\
+         # TYPE custos_events_already_banned_total counter\ncustos_events_already_banned_total {}\n\
+         # TYPE custos_new_ban_decisions_total counter\ncustos_new_ban_decisions_total {}\n\
+         # TYPE custos_ban_decision_updates_total counter\ncustos_ban_decision_updates_total {}\n\
+         # TYPE custos_firewall_ban_refreshes_total counter\ncustos_firewall_ban_refreshes_total {}\n\
+         # TYPE custos_analysis_latency_milliseconds_sum counter\ncustos_analysis_latency_milliseconds_sum {}\n\
+         # TYPE custos_analysis_latency_milliseconds_count counter\ncustos_analysis_latency_milliseconds_count {}\n",
+        state.health.uptime_secs(), state.health.events_received.load(Ordering::Relaxed),
+        state.health.already_banned.load(Ordering::Relaxed), state.health.new_bans.load(Ordering::Relaxed),
+        state.health.ban_updates.load(Ordering::Relaxed), state.firewall.metrics.ban_refreshes.load(Ordering::Relaxed),
+        state.health.analysis_latency_ms_total.load(Ordering::Relaxed), state.health.analysis_completed.load(Ordering::Relaxed)));
+    if let Some(counters) = state.firewall.kernel_counters() {
+        body.push_str(&format!("# TYPE custos_kernel_dropped_packets_total counter\ncustos_kernel_dropped_packets_total {}\n# TYPE custos_kernel_dropped_bytes_total counter\ncustos_kernel_dropped_bytes_total {}\n# TYPE custos_kernel_counters_sampled_at gauge\ncustos_kernel_counters_sampled_at {}\n", counters.dropped_packets, counters.dropped_bytes, counters.sampled_at.timestamp()));
+    }
+    body.push_str(&format!(
+        "# TYPE custos_kernel_counters_available gauge\ncustos_kernel_counters_available {}\n",
+        usize::from(state.firewall.kernel_counters().is_some())
+    ));
+    for source in state.health.sources() {
+        body.push_str(&format!("custos_log_records_parsed_total{{source=\"{}\"}} {}\ncustos_log_records_malformed_total{{source=\"{}\"}} {}\ncustos_log_records_oversized_total{{source=\"{}\"}} {}\ncustos_log_read_errors_total{{source=\"{}\"}} {}\ncustos_log_backlog_bytes{{source=\"{}\"}} {}\ncustos_log_last_read_unix{{source=\"{}\"}} {}\n",
+            source.source_id, source.parsed, source.source_id, source.malformed, source.source_id, source.oversized,
+            source.source_id, source.read_errors, source.source_id, source.backlog_bytes, source.source_id, source.last_read_unix));
+    }
+    for crawler in state.crawlers.list() {
+        body.push_str(&format!("custos_crawler_feed_stale{{crawler=\"{}\"}} {}\ncustos_crawler_prefixes{{crawler=\"{}\"}} {}\n", crawler.entry.id, usize::from(crawler.stale), crawler.entry.id, crawler.prefix_count));
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(

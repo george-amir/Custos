@@ -79,9 +79,10 @@ fn run_worker(
         }
         while rx.try_recv().is_ok() {}
         last_pass = Some(Instant::now());
+        let sample_due = Instant::now() >= next_refresh;
         if (dirty.load(Ordering::Relaxed) || Instant::now() >= next_refresh) && refresh.is_empty() {
             dirty.store(false, Ordering::Relaxed);
-            refresh.extend(store.list_active().into_iter().map(|decision| decision.ip));
+            refresh.extend(store.active_ips());
             next_refresh = Instant::now() + Duration::from_secs(60);
         }
         let group: Vec<_> = refresh
@@ -103,12 +104,19 @@ fn run_worker(
                     )?;
                 }
                 firewall.ban_ips_batch(&entries)?;
+                firewall
+                    .metrics
+                    .ban_refreshes
+                    .fetch_add(entries.len() as u64, Ordering::Relaxed);
                 Ok(())
             })();
             if let Err(error) = result {
                 tracing::warn!(%error, "Durable firewall enforcement retained for retry");
                 dirty.store(true, Ordering::Relaxed);
             }
+        }
+        if sample_due {
+            firewall.sample_counters();
         }
         let candidates = store.sweep_expired();
         if candidates.is_empty() {

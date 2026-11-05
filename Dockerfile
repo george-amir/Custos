@@ -5,6 +5,7 @@ WORKDIR /usr/src/custos
 COPY Cargo.toml Cargo.lock ./
 COPY proto ./proto
 COPY src ./src
+COPY data ./data
 
 RUN cargo build --release --locked
 

@@ -324,6 +324,7 @@ pub fn visit_log_file(
 
 #[derive(Default)]
 struct TailCursor {
+    health: Option<std::sync::Arc<crate::health::SourceHealth>>,
     offset: u64,
     identity: Option<(u64, u64)>,
     discarding_oversized: bool,
@@ -394,6 +395,10 @@ fn read_available(
     match cursor.identity {
         None => cursor.offset = if from_start { 0 } else { len },
         Some(previous) if previous != identity || len < cursor.offset => {
+            if let Some(h) = &cursor.health {
+                h.rotations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             cursor.offset = 0;
             cursor.discarding_oversized = false;
         }
@@ -402,7 +407,20 @@ fn read_available(
     cursor.identity = Some(identity);
     file.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::new(file);
-    read_records(source, cursor, &mut reader)
+    let result = read_records(source, cursor, &mut reader);
+    if let Some(h) = &cursor.health {
+        h.backlog_bytes.store(
+            len.saturating_sub(cursor.offset),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if result.is_ok() {
+            h.last_read_unix.store(
+                Utc::now().timestamp().max(0) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+    result
 }
 
 fn read_records(
@@ -429,6 +447,10 @@ fn read_records(
             Err(error) => {
                 // Already committed records must still reach the consumer. The
                 // failed record's offset is unchanged, so the next poll retries it.
+                if let Some(h) = &cursor.health {
+                    h.read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 cursor.full_batch = false;
                 warn!(path = %source.path.display(), offset = cursor.offset, %error, "Read interrupted; delivering complete records before retry");
                 break;
@@ -439,6 +461,12 @@ fn read_records(
             break;
         }
         if cursor.discarding_oversized || bytes > MAX_LOG_RECORD_BYTES {
+            if !cursor.discarding_oversized
+                && let Some(h) = &cursor.health
+            {
+                h.oversized
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             cursor.offset += bytes as u64;
             cursor.discarding_oversized = !record.ends_with(b"\n");
             continue;
@@ -449,13 +477,28 @@ fn read_records(
         }
         cursor.offset += bytes as u64;
         let Ok(line) = std::str::from_utf8(&record) else {
+            if let Some(h) = &cursor.health {
+                h.malformed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             warn!(path = %source.path.display(), offset = cursor.offset, "Skipped access log record with invalid UTF-8");
             continue;
         };
         if let Some(event) = parse_log_line(line, source.format) {
+            if let Some(h) = &cursor.health {
+                h.parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                h.last_event_unix.store(
+                    event.timestamp.timestamp().max(0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             batch_bytes += bytes;
             events.push(event);
         } else if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            if let Some(h) = &cursor.health {
+                h.malformed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             warn!(path = %source.path.display(), offset = cursor.offset, "Skipped malformed access log record");
         }
     }
@@ -490,7 +533,13 @@ fn spawn_reader(
     read_from_start: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut cursor = TailCursor::default();
+        let mut cursor = TailCursor {
+            health: match &sink {
+                LogSink::Pipeline(pipeline) => pipeline.health.source(&source.path),
+                LogSink::Channel(_) => None,
+            },
+            ..Default::default()
+        };
         loop {
             if matches!(&sink, LogSink::Channel(tx) if tx.is_closed()) {
                 return;
@@ -526,6 +575,10 @@ fn spawn_reader(
                     }
                 }
                 Err(error) => {
+                    if let Some(h) = &cursor.health {
+                        h.read_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     warn!(path = %source.path.display(), %error, "Unable to read log source; will retry")
                 }
             }

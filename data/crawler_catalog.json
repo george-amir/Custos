@@ -1,0 +1,72 @@
+[
+  {
+    "id": "googlebot",
+    "name": "Google common crawlers (Googlebot)",
+    "category": "search",
+    "source_url": "https://developers.google.com/static/crawling/ipranges/common-crawlers.json",
+    "documentation_url": "https://developers.google.com/crawling/docs/crawlers-fetchers/verify-google-requests"
+  },
+  {
+    "id": "google_special",
+    "name": "Google special crawlers (AdsBot)",
+    "category": "search",
+    "source_url": "https://developers.google.com/static/crawling/ipranges/special-crawlers.json",
+    "documentation_url": "https://developers.google.com/crawling/docs/crawlers-fetchers/verify-google-requests"
+  },
+  {
+    "id": "google_fetchers",
+    "name": "Google-controlled user-triggered fetchers",
+    "category": "fetcher",
+    "source_url": "https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json",
+    "documentation_url": "https://developers.google.com/crawling/docs/crawlers-fetchers/verify-google-requests"
+  },
+  {
+    "id": "bingbot",
+    "name": "Bingbot",
+    "category": "search",
+    "source_url": "https://www.bing.com/toolbox/bingbot.json",
+    "documentation_url": "https://www.bing.com/webmasters/help/which-crawlers-does-bing-use-8c184ec0"
+  },
+  {
+    "id": "applebot",
+    "name": "Applebot",
+    "category": "search",
+    "source_url": "https://search.developer.apple.com/applebot.json",
+    "documentation_url": "https://support.apple.com/en-us/119829"
+  },
+  {
+    "id": "gptbot",
+    "name": "GPTBot",
+    "category": "training",
+    "source_url": "https://openai.com/gptbot.json",
+    "documentation_url": "https://developers.openai.com/api/docs/bots"
+  },
+  {
+    "id": "oai_searchbot",
+    "name": "OAI-SearchBot",
+    "category": "search",
+    "source_url": "https://openai.com/searchbot.json",
+    "documentation_url": "https://developers.openai.com/api/docs/bots"
+  },
+  {
+    "id": "chatgpt_user",
+    "name": "ChatGPT-User",
+    "category": "fetcher",
+    "source_url": "https://openai.com/chatgpt-user.json",
+    "documentation_url": "https://developers.openai.com/api/docs/bots"
+  },
+  {
+    "id": "oai_adsbot",
+    "name": "OAI-AdsBot",
+    "category": "fetcher",
+    "source_url": "https://openai.com/adsbot.json",
+    "documentation_url": "https://developers.openai.com/api/docs/bots"
+  },
+  {
+    "id": "nokia_genome",
+    "name": "Nokia Deepfield Genome",
+    "category": "measurement",
+    "source_url": "https://genome.deepfield.net/crawlers.txt",
+    "documentation_url": "https://www.nokia.com/genomecrawler/"
+  }
+]

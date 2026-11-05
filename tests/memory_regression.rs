@@ -263,7 +263,9 @@ async fn slow_api_readers_cannot_accumulate_unlimited_response_bodies() {
         api_token: String::new(),
     });
     let mut held = Vec::new();
-    for _ in 0..16 {
+    // Management responses have four independent slots; enforcement keeps its
+    // own sixteen slots so slow administrative readers cannot starve checks.
+    for _ in 0..4 {
         let response = app
             .clone()
             .oneshot(

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
+    pub crawlers: crate::crawlers::CrawlerConfig,
+    #[serde(default)]
     pub memory: crate::limits::MemoryLimits,
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -44,6 +46,9 @@ pub struct HubConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirewallConfig {
+    /// Also enforce source-IP bans on routed/Docker traffic (nftables only).
+    #[serde(default)]
+    pub protect_docker: bool,
     #[serde(default = "default_firewall_enabled")]
     pub enabled: bool,
     #[serde(default = "default_firewall_backend")]
@@ -257,6 +262,7 @@ impl Default for HubConfig {
 impl Default for FirewallConfig {
     fn default() -> Self {
         Self {
+            protect_docker: false,
             enabled: default_firewall_enabled(),
             backend: default_firewall_backend(),
             dry_run: default_firewall_dry_run(),
@@ -371,6 +377,7 @@ impl AppConfig {
         }
         cfg.memory.validate()?;
         cfg.window.validate()?;
+        cfg.crawlers.validate()?;
         Ok(cfg)
     }
 

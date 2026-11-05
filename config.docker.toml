@@ -16,6 +16,8 @@ enabled = true
 backend = "nftables"
 dry_run = false
 table_name = "custos_block"
+# Opt in when this host-network deployment must protect forwarded web containers.
+protect_docker = false
 
 [hub]
 enabled = false

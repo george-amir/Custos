@@ -38,6 +38,49 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 ---
 
+## v0.5.0 (unreleased): Verified crawler controls and Docker enforcement
+
+Custos now identifies ten crawler/fetcher services using their publishers' IP lists: Google common crawlers, Google special crawlers, Google-controlled fetchers, Bingbot, Applebot, GPTBot, OAI-SearchBot, ChatGPT-User, OAI-AdsBot, and Nokia Deepfield Genome. Network ownership, country, and a claimed User-Agent do not grant a crawler exception. Each service lists its official feed, documentation, freshness, category, and configured policy.
+
+| Policy ID | Verified service | Publisher feed |
+| :--- | :--- | :--- |
+| `googlebot` | Google common crawlers | [Google](https://developers.google.com/static/crawling/ipranges/common-crawlers.json) |
+| `google_special` | Google special crawlers, including AdsBot | [Google](https://developers.google.com/static/crawling/ipranges/special-crawlers.json) |
+| `google_fetchers` | Google-controlled user-triggered fetchers | [Google](https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json) |
+| `bingbot` | Bingbot | [Microsoft](https://www.bing.com/toolbox/bingbot.json) |
+| `applebot` | Applebot | [Apple](https://search.developer.apple.com/applebot.json) |
+| `gptbot` | GPTBot | [OpenAI](https://openai.com/gptbot.json) |
+| `oai_searchbot` | OAI-SearchBot | [OpenAI](https://openai.com/searchbot.json) |
+| `chatgpt_user` | ChatGPT-User | [OpenAI](https://openai.com/chatgpt-user.json) |
+| `oai_adsbot` | OAI-AdsBot | [OpenAI](https://openai.com/adsbot.json) |
+| `nokia_genome` | Nokia Deepfield Genome | [Nokia](https://genome.deepfield.net/crawlers.txt) |
+
+```sh
+custos crawlers list
+custos crawlers identify 216.180.246.202
+sudo custos --config /etc/custos/config.toml crawlers block nokia_genome
+sudo custos --config /etc/custos/config.toml crawlers allow nokia_genome
+# "unblock" is an alias for "allow"; "normal" restores ordinary analysis.
+sudo custos --config /etc/custos/config.toml crawlers normal nokia_genome
+sudo custos --config /etc/custos/config.toml crawlers refresh
+sudo custos --config /etc/custos/config.toml explain 216.180.246.202
+sudo custos --config /etc/custos/config.toml logs
+```
+
+Administrative commands require `daemon.api_token` or `CUSTOS_API_TOKEN` in the CLI process's environment. A systemd `EnvironmentFile` is loaded by the service, not automatically by a separate CLI process. An empty token disables crawler mutations and detailed evidence/log-health reads.
+
+All services default to `normal`. `block` rejects verified matching addresses immediately at the HTTP checker and records kernel IP bans when their log events arrive. `allow` permits ordinary crawling and removes local policy/scanner/enumeration bans; it retains manual, community, cached-exploit, and corroborated exploit bans. Rate limits and protected request signatures still apply. Decisions explain service identity, evidence, and the policy action separately.
+
+The daemon refreshes publisher feeds off the request path at startup and every 24 hours. Embedded integrations can schedule `pipeline.crawlers.refresh()` themselves. Verification expires after seven days without a successful refresh; stale/unrecognized addresses receive normal analysis rather than a trust exception. The compiled snapshot permits offline startup. Saved runtime policies override TOML defaults and survive restart in a private sibling file, such as `/var/lib/custos/decisions.crawlers.json`; `crawlers.state_file` can choose another path. Feed bytes, prefix counts, policy names, source-health entries, and stored evidence have fixed admission limits. Overlapping service ranges use the stricter policy.
+
+Public `/v1/decisions` retains legacy score fields and adds `maliciousness_score` and `threat_class_confidence` for local Jev decisions. Detailed redacted evidence is available only through authenticated `GET /v1/decisions/{ip}/evidence`. Authenticated `PUT /v1/crawlers/{id}` accepts `{"policy":"block"}` (or `allow` / `normal`); `GET /v1/crawlers`, `GET /v1/crawlers/identify?ip=...`, and authenticated `POST /v1/crawlers/refresh` expose the catalog. If cleanup fails, the policy remains saved, the API reports a conflict, and the durable cleanup obligation remains for retry.
+
+`/v1/stats` and `/metrics` now distinguish new decisions, ban updates, firewall refreshes, and actual kernel packet drops. Kernel counters are sampled outside the request path once per minute; `null`/unavailable indicates missing counters, disabled enforcement, or an unsupported backend. Kernel totals reset when their rules are recreated. Uptime and process start time identify application counter resets. Analysis latency measures elapsed time from the window's last received evidence to completion. Authenticated `GET /v1/logs` reports parsing failures, oversized records, rotation, read errors, byte backlog, and successful read/event timestamps. Management requests have a separate bounded admission pool from enforcement checks. The cost field remains an input-token estimate, not a provider invoice.
+
+On Linux nftables, enable `firewall.protect_docker = true` to install IPv4 and IPv6 source-ban rules on both the input and forward hooks. Custos restores its chains and active bans on restart without flushing other firewall tables. This replaces the manual Docker forwarding workaround. If previously installed, remove only its Custos-specific systemd drop-in after enabling this setting; never flush the Docker host's full ruleset. Other firewall backends reject this option explicitly.
+
+Validation: 171 Rust tests pass, including 16 crawler regressions and an isolated 220,000-event saturation profile that checks normal admission, bounded memory, active bans, and pending kernel cleanup. Live Docker checks cover native Traefik ForwardAuth, Nginx throttling, IPv4/IPv6 forwarding drops, restart recovery, and unbanning. Both nftables and ipset clean 256 expired bans in two batch removals while all 25 normal checks remain allowed. CLI controls and all ten official feed refreshes were also verified locally.
+
 ## v0.4.1: Native Traefik / Dokploy JSON access logs
 
 [Download v0.4.1](https://github.com/george-amir/Custos/releases/tag/v0.4.1). The JSON parser now recognizes Traefik's native field names, including `ClientHost` (or `ClientAddr`), `RequestMethod`, `RequestPath`, and `DownstreamStatus`. It preserves the request timestamp with nanosecond precision, using `StartUTC`, then `StartLocal`, then `time`. Client-facing status and bytes are used even when Traefik generates the response itself (`OriginStatus = 0`). Traefik's server-wide `RequestCount` never becomes a per-IP request count.
@@ -467,8 +510,13 @@ http:
     custos-bouncer:
       forwardAuth:
         address: "http://127.0.0.1:8085/v1/bouncer/check"
-        trustForwardHeader: true
+        trustForwardHeader: false
+        authRequestHeaders: [User-Agent]
 ```
+
+The loopback address above requires Traefik and Custos to share the host network namespace. For bridged Dokploy/Traefik, use a host-reachable **private** address for Custos, bind `daemon.bouncer_listen` there, and add the exact Traefik container peer to `daemon.trusted_proxies`. Keep the API private. Configure the middleware on each protected router and configure Traefik's trusted upstream proxies separately if a CDN sits in front. The checker accepts native `X-Forwarded-Method`/`X-Forwarded-Uri` as well as the Nginx/Caddy original-request headers. Conflicting original/forwarded headers are rejected; trusted header metadata takes precedence over query fallbacks. Administrative diagnostic checks can authenticate with the admin token.
+
+Cached signatures reject matching requests before the backend runs. Unknown attacks evaluated from access logs have already reached the server; this does not replace application patching or general request-body inspection.
 
 ### Traefik / Dokploy JSON Access Logs
 
@@ -709,6 +757,8 @@ cargo fmt --all -- --check
 ```
 
 Regression suites cover authentication, signature poisoning, bounded memory, concurrent journal writes, cleanup/retry, batch failures, log rotation and partial records, Hub cursors/expiry/reconnection, private credentials, and deployment contracts. CI additionally builds the Docker image, checks enforcement in an isolated container network namespace, and starts/stops an ephemeral Windows SCM service.
+
+Crawler regressions cover publisher-prefix verification, stale feeds, persisted controls, private/redacted evidence, manual/exploit-ban preservation, unblock races, and management/enforcement admission separation. `cargo test --test crawler_stress -- --nocapture` runs an isolated 220,000-event saturation profile and checks the RSS plateau, normal HTTP checks, active bans, and pending kernel cleanup. After building `custos:ci`, run `python3 .github/scripts/docker-crawler-firewall-smoke.py` for real IPv4/IPv6 forwarding drops, restart recovery, unbanning, and native Traefik ForwardAuth. Its firewall changes are confined to disposable container namespaces.
 
 ---
 

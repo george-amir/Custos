@@ -5,6 +5,7 @@ Run after `docker build -t custos:ci .`. Requires Docker and Python 3.
 """
 import ipaddress
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -40,10 +41,12 @@ backend = "''' + backend + '''"
 table_name = "custos_native"
 [memory]
 max_decisions = 257
+[crawlers]
+auto_refresh = false
 ''')
         created = False
         try:
-            docker('run', '-d', '--name', name, '--cap-add=NET_ADMIN', '-p', '127.0.0.1::8085', '-v', folder + ':/state', 'custos:ci', '--config', '/state/config.toml', 'run', '--mock-jev')
+            docker('run', '-d', '--name', name, '--cap-add=NET_ADMIN', '-p', '127.0.0.1::8085', '-v', folder + ':/state', os.environ.get('CUSTOS_TEST_IMAGE', 'custos:ci'), '--config', '/state/config.toml', 'run', '--mock-jev')
             created = True
             root = 'http://' + docker('port', name, '8085/tcp').stdout.strip().splitlines()[0]
             def request(path, method='GET', data=None):

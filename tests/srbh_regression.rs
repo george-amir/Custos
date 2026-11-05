@@ -231,10 +231,16 @@ fn retained_state_is_bounded_even_with_extreme_count_configuration() {
         l1_flood_threshold: usize::MAX,
         ..Default::default()
     });
+    // This measures storage caps, independently of build-host speed or window rollover.
+    let timestamp = Utc::now();
     for i in 0..2048 {
-        w.ingest(&event(&format!("/products/{i}/{}", "x".repeat(8000))));
+        let mut request = event(&format!("/products/{i}/{}", "x".repeat(8000)));
+        request.timestamp = timestamp;
+        w.ingest(&request);
     }
-    w.ingest(&event("/.env"));
+    let mut trigger = event("/.env");
+    trigger.timestamp = timestamp;
+    w.ingest(&trigger);
     let summaries = w.drain_suspicious_summaries(true);
     assert_eq!(summaries[0].unique_paths, 1024);
     assert_eq!(summaries[0].sample_requests.len(), 32);
