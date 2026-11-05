@@ -9,6 +9,199 @@ use custos::{
 };
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn crawler_cli_accepts_multiple_ids_all_and_short_options() {
+    use custos::crawlers::CrawlerPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let p = SecurityPipeline::builder()
+        .with_config(fresh_config(dir.path()))
+        .with_mock_jev(true)
+        .build()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = build_bouncer_router(AppState {
+        pipeline: p.clone(),
+        api_token: "cli-test".into(),
+    });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let config = dir.path().join("cli.toml");
+    std::fs::write(&config, "[firewall]\nenabled = false\n").unwrap();
+    for (args, policy, count) in [
+        (
+            vec!["block", "gptbot", "nokia_genome"],
+            CrawlerPolicy::Block,
+            2,
+        ),
+        (vec!["block", "all"], CrawlerPolicy::Block, 10),
+        (vec!["unblock", "-a"], CrawlerPolicy::Allow, 10),
+        (vec!["normal", "--all"], CrawlerPolicy::Normal, 10),
+    ] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_custos"))
+            .arg("-c")
+            .arg(&config)
+            .arg("crawlers")
+            .args(args)
+            .args(["-u", &url])
+            .env("CUSTOS_API_TOKEN", "cli-test")
+            .env("NO_PROXY", "*")
+            .env("no_proxy", "*")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            p.crawlers
+                .list()
+                .iter()
+                .filter(|c| c.policy == policy)
+                .count(),
+            count
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn batch_crawler_controls_are_authenticated_atomic_and_preserve_manual_bans() {
+    use custos::{crawlers::CrawlerPolicy, store::DecisionSource};
+    let dir = tempfile::tempdir().unwrap();
+    let p = SecurityPipeline::builder()
+        .with_config(fresh_config(dir.path()))
+        .with_mock_jev(true)
+        .build()
+        .unwrap();
+    let app = build_bouncer_router(AppState {
+        pipeline: p.clone(),
+        api_token: "admin".into(),
+    });
+    let request = |body: serde_json::Value, token: &str| {
+        Request::builder()
+            .method("PUT")
+            .uri("/v1/crawlers")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let selected = serde_json::json!({"policy":"block", "ids":["nokia_genome", "googlebot"]});
+    assert_eq!(
+        app.clone()
+            .oneshot(request(selected.clone(), "wrong"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        p.crawlers
+            .list()
+            .iter()
+            .all(|c| c.policy == CrawlerPolicy::Normal)
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(selected, "admin"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.crawlers
+            .list()
+            .iter()
+            .filter(|c| c.policy == CrawlerPolicy::Block)
+            .count(),
+        2
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                serde_json::json!({"policy":"block", "ids":["bingbot", "typo"]}),
+                "admin"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        p.crawlers
+            .list()
+            .iter()
+            .find(|c| c.entry.id == "bingbot")
+            .unwrap()
+            .policy,
+        CrawlerPolicy::Normal
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                serde_json::json!({"policy":"block", "all":true}),
+                "admin"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        p.crawlers
+            .list()
+            .iter()
+            .all(|c| c.policy == CrawlerPolicy::Block)
+    );
+    let manual = "216.180.246.202".parse().unwrap();
+    p.record_ban(
+        manual,
+        "manual_block".into(),
+        DecisionSource::ManualAdmin,
+        1.,
+        1.,
+        "Keep this ban".into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        app.oneshot(request(
+            serde_json::json!({"policy":"allow", "all":true}),
+            "admin"
+        ))
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    assert!(
+        p.crawlers
+            .list()
+            .iter()
+            .all(|c| c.policy == CrawlerPolicy::Allow)
+    );
+    assert_eq!(
+        p.store.check_ip(&manual).unwrap().source,
+        DecisionSource::ManualAdmin
+    );
+    let restored = custos::crawlers::CrawlerRegistry::open(
+        Default::default(),
+        Some(dir.path().join("crawlers.json")),
+    )
+    .unwrap();
+    assert!(
+        restored
+            .list()
+            .iter()
+            .all(|c| c.policy == CrawlerPolicy::Allow)
+    );
+}
+
 #[test]
 fn crawler_state_cannot_replace_the_ban_journal_through_a_path_alias() {
     let directory = tempfile::tempdir().unwrap();

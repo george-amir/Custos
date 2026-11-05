@@ -16,6 +16,7 @@ pub mod sanitizer;
 pub mod service;
 pub mod store;
 pub mod tailer;
+pub mod update;
 pub mod window;
 pub mod windows_service;
 
@@ -196,13 +197,21 @@ pub struct SecurityPipeline {
 impl SecurityPipeline {
     /// Policy is durable before cleanup. Failed removals remain in the ban ledger for retry.
     pub fn set_crawler_policy(&self, id: &str, policy: crawlers::CrawlerPolicy) -> Result<usize> {
+        self.set_crawler_policies(&[id.to_owned()], policy)
+    }
+
+    pub fn set_crawler_policies(
+        &self,
+        ids: &[String],
+        policy: crawlers::CrawlerPolicy,
+    ) -> Result<usize> {
         let _operation = self
             .crawler_mutation
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Crawler policy update already in progress"))?;
         {
             let _guard = self.enforcement_guard()?;
-            self.crawlers.set_policy(id, policy)?;
+            self.crawlers.set_policies(ids, policy)?;
         }
         let mut removed = 0;
         let mut errors = Vec::new();
@@ -219,7 +228,7 @@ impl SecurityPipeline {
                         if self
                             .crawlers
                             .identify(*ip)
-                            .is_none_or(|identity| identity.id != id)
+                            .is_none_or(|identity| !ids.contains(&identity.id))
                         {
                             continue;
                         }

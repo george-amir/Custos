@@ -26,9 +26,14 @@ use tracing::{error, info};
 #[command(
     name = "custos",
     version,
+    disable_version_flag = true,
+    propagate_version = true,
     about = "Custos: Autonomous behavioral security engine & cross-platform firewall bouncer powered by TypeSafe AI's Jev (/v1/systemone)"
 )]
 struct Cli {
+    /// Print version
+    #[arg(short = 'v', visible_short_alias = 'V', long, action = clap::ArgAction::Version, global = true)]
+    version: Option<bool>,
     /// Path to config.toml
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
@@ -42,22 +47,40 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Check for or install a verified stable release
+    #[command(visible_alias = "upgrade")]
+    Update {
+        /// Check the latest version without downloading or installing a binary
+        #[arg(short = 'n', long, conflicts_with = "restart")]
+        check: bool,
+        /// Select a stable version, for example v0.5.0 (downgrades are refused)
+        #[arg(short = 't', long, value_name = "VERSION")]
+        to: Option<String>,
+        /// Restart the installed OS service after a successful update
+        #[arg(long)]
+        restart: bool,
+    },
     /// List verified crawlers and manage their persisted policies
     Crawlers {
         #[command(subcommand)]
         action: CrawlerAction,
-        #[arg(long, global = true, default_value = "http://127.0.0.1:8085")]
+        #[arg(
+            short = 'u',
+            long,
+            global = true,
+            default_value = "http://127.0.0.1:8085"
+        )]
         api_url: String,
     },
     /// Show the bounded, redacted evidence for one active ban (admin token required)
     Explain {
         ip: IpAddr,
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
     /// Inspect log ingestion health (admin token required)
     Logs {
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
     /// Auto-detect host OS firewall & web server logs and generate a ready-to-run config.toml
@@ -74,11 +97,12 @@ enum Commands {
     /// Run the custos daemon (tails configured or auto-discovered log files, runs Jev batch analyzer, serves Bouncer HTTP API, OS Firewall, and gRPC Hub stream)
     Run {
         /// Log file to tail; updates a matching configured source without duplicating it
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         log: Option<PathBuf>,
 
         /// Format of the file supplied with --log (json supports Traefik and Caddy)
         #[arg(
+            short = 'f',
             long,
             alias = "log-format",
             value_enum,
@@ -92,7 +116,7 @@ enum Commands {
         from_start: bool,
 
         /// Use local deterministic Jev simulator (no API key required)
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'm', long, default_value_t = false)]
         mock_jev: bool,
 
         /// Override OS firewall backend: auto, pf, nftables, ipset, windows_netsh
@@ -115,15 +139,21 @@ enum Commands {
     /// Replay a log file from start to finish, evaluate suspicious windows in bulk via Jev, and optionally push verdicts to CustosHub over gRPC
     Replay {
         /// Path to access log file
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         log: PathBuf,
 
         /// Log format (json supports native Traefik, Caddy, and flat JSON records)
-        #[arg(long, value_enum, ignore_case = true, default_value = "nginx_combined")]
+        #[arg(
+            short = 'f',
+            long,
+            value_enum,
+            ignore_case = true,
+            default_value = "nginx_combined"
+        )]
         format: LogFormat,
 
         /// Use local deterministic Jev simulator (no API key required)
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'm', long, default_value_t = false)]
         mock_jev: bool,
 
         /// Override OS firewall backend: auto, pf, nftables, ipset, windows_netsh
@@ -186,7 +216,7 @@ enum Commands {
 
     /// Query active ban decisions from the running daemon (or local decisions.jsonl)
     Decisions {
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
 
@@ -199,27 +229,27 @@ enum Commands {
         reason: String,
         #[arg(long)]
         ttl_secs: Option<u64>,
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
 
     /// Remove an active ban for an IP address
     Unban {
         ip: IpAddr,
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
 
     /// Check if an IP is allowed or blocked via the Bouncer API
     Check {
         ip: IpAddr,
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
 
     /// Show real-time pipeline, Jev token, and OS firewall telemetry from the running daemon
     Stats {
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        #[arg(short = 'u', long, default_value = "http://127.0.0.1:8085")]
         api_url: String,
     },
 
@@ -258,17 +288,21 @@ enum CrawlerAction {
     Identify {
         ip: IpAddr,
     },
-    Block {
-        id: String,
-    },
+    Block(CrawlerTargets),
     #[command(alias = "unblock")]
-    Allow {
-        id: String,
-    },
-    Normal {
-        id: String,
-    },
+    Allow(CrawlerTargets),
+    Normal(CrawlerTargets),
     Refresh,
+}
+
+#[derive(clap::Args, Debug)]
+struct CrawlerTargets {
+    /// One or more catalog IDs, or the word "all"
+    #[arg(num_args = 1.., required_unless_present = "all", conflicts_with = "all")]
+    ids: Vec<String>,
+    /// Apply the policy to every catalog service
+    #[arg(short = 'a', long)]
+    all: bool,
 }
 
 fn main() -> Result<()> {
@@ -296,6 +330,9 @@ async fn async_main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Some(Commands::Update { check, to, restart }) = &cli.command {
+        return cmd_update(*check, to.as_deref(), *restart).await;
+    }
     let mut cfg = AppConfig::load_or_default(cli.config.as_deref())?;
 
     let command = cli.command.unwrap_or(Commands::Run {
@@ -310,6 +347,7 @@ async fn async_main() -> Result<()> {
     });
 
     match command {
+        Commands::Update { .. } => unreachable!("update bypasses daemon configuration"),
         Commands::Crawlers { action, api_url } => {
             cmd_crawlers(action, &api_url, &cfg.daemon.api_token).await
         }
@@ -1114,6 +1152,38 @@ async fn cmd_admin_get(url: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_update(check: bool, requested: Option<&str>, restart: bool) -> Result<()> {
+    use custos::update::{ReleaseUpdater, UpdateStatus};
+    let updater = ReleaseUpdater::github()?;
+    match updater.check(env!("CARGO_PKG_VERSION"), requested).await? {
+        UpdateStatus::Current { installed, latest } => {
+            println!("Custos {installed} is up to date (latest published: {latest}).");
+        }
+        UpdateStatus::Available(plan) if check => {
+            println!(
+                "Update available: {} -> {}. Run `custos update` to install.",
+                env!("CARGO_PKG_VERSION"),
+                plan.version()
+            );
+        }
+        UpdateStatus::Available(plan) => {
+            println!("Downloading and verifying Custos {}...", plan.version());
+            let version = updater.install(plan).await?;
+            println!("Installed Custos {version}. Configuration and ban state were preserved.");
+            if !restart {
+                println!("Restart your running Custos service to activate the new executable.");
+            }
+        }
+    }
+    if restart {
+        tokio::task::spawn_blocking(custos::service::restart_service)
+            .await?
+            .context("Binary is installed, but the service restart failed")?;
+        println!("Custos service restarted.");
+    }
+    Ok(())
+}
+
 async fn cmd_crawlers(action: CrawlerAction, api_url: &str, token: &str) -> Result<()> {
     let base = api_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
@@ -1133,24 +1203,28 @@ async fn cmd_crawlers(action: CrawlerAction, api_url: &str, token: &str) -> Resu
                 CrawlerAction::Refresh => client
                     .post(format!("{base}/v1/crawlers/refresh"))
                     .bearer_auth(token),
-                CrawlerAction::Block { ref id }
-                | CrawlerAction::Allow { ref id }
-                | CrawlerAction::Normal { ref id } => {
+                CrawlerAction::Block(ref targets)
+                | CrawlerAction::Allow(ref targets)
+                | CrawlerAction::Normal(ref targets) => {
                     let policy = match &action {
-                        CrawlerAction::Block { .. } => "block",
-                        CrawlerAction::Allow { .. } => "allow",
+                        CrawlerAction::Block(_) => "block",
+                        CrawlerAction::Allow(_) => "allow",
                         _ => "normal",
                     };
+                    let all = targets.all || targets.ids == ["all"];
+                    let ids = if all { Vec::new() } else { targets.ids.clone() };
                     anyhow::ensure!(
-                        custos::crawlers::CATALOG
-                            .iter()
-                            .any(|entry| entry.id == id.as_str()),
+                        all || (!ids.is_empty()
+                            && ids.len() <= custos::crawlers::CATALOG.len()
+                            && ids.iter().all(|id| custos::crawlers::CATALOG
+                                .iter()
+                                .any(|entry| &entry.id == id))),
                         "Unknown crawler identity"
                     );
                     client
-                        .put(format!("{base}/v1/crawlers/{id}"))
+                        .put(format!("{base}/v1/crawlers"))
                         .bearer_auth(token)
-                        .json(&serde_json::json!({"policy":policy}))
+                        .json(&serde_json::json!({"policy":policy, "ids":ids, "all":all}))
                 }
                 _ => unreachable!(),
             }

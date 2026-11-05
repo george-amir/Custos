@@ -400,13 +400,26 @@ impl CrawlerRegistry {
     }
 
     pub fn set_policy(&self, id: &str, policy: CrawlerPolicy) -> Result<()> {
-        entry(id)?;
+        self.set_policies(&[id.to_owned()], policy)
+    }
+
+    /// Validate the whole selection and persist it in one atomic replacement.
+    pub fn set_policies(&self, ids: &[String], policy: CrawlerPolicy) -> Result<()> {
+        ensure!(
+            !ids.is_empty() && ids.len() <= CATALOG.len(),
+            "Invalid crawler selection size"
+        );
+        for id in ids {
+            entry(id)?;
+        }
         let mut state = self
             .state
             .write()
             .map_err(|_| anyhow::anyhow!("Crawler registry lock poisoned"))?;
         let mut next = state.persistent.clone();
-        next.policies.insert(id.to_owned(), policy);
+        for id in ids {
+            next.policies.insert(id.clone(), policy);
+        }
         self.commit(&mut state, next)
     }
 

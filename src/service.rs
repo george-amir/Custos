@@ -509,6 +509,25 @@ pub fn stop_service() -> Result<()> {
     )
 }
 
+pub fn restart_service() -> Result<()> {
+    match ServicePlatform::detect() {
+        ServicePlatform::Systemd => run_cmd("systemctl", &["restart", "custos"]),
+        ServicePlatform::Launchd => run_cmd(
+            "launchctl",
+            &["kickstart", "-k", "system/ai.typesafe.custos"],
+        ),
+        ServicePlatform::WindowsSc => run_cmd(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Restart-Service -Name Custos -ErrorAction Stop",
+            ],
+        ),
+    }
+}
+
 pub fn uninstall_service() -> Result<()> {
     match ServicePlatform::detect() {
         ServicePlatform::Systemd => {

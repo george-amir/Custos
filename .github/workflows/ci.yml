@@ -49,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Verify release asset and checksum contract
+        run: python3 .github/scripts/test_release.py
       - run: docker build -t custos:ci .
       - run: ./.github/scripts/docker-smoke.sh
       - name: Verify native expiry, batch cleanup, and availability at saturation

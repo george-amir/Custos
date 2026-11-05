@@ -38,7 +38,22 @@ Inspired by CrowdSec and Fail2Ban, **Custos** replaces brittle regex-maintenance
 
 ---
 
-## v0.5.0 (unreleased): Verified crawler controls and Docker enforcement
+## v0.5.0: Verified crawler controls, self-updates, and Docker enforcement
+
+[Download v0.5.0](https://github.com/george-amir/Custos/releases/tag/v0.5.0).
+
+```sh
+custos -v                         # also --version and -V
+custos update --check              # check without downloading/installing a binary
+sudo /usr/local/bin/custos update --restart
+custos update --to v0.5.0 --check   # select a stable version
+```
+
+The updater downloads the matching platform executable from this repository, verifies its GitHub SHA-256 digest, and checks that it runs and reports the expected version before replacement. Metadata, download sizes, and validation time are bounded. Configuration, crawler policies, bans, and pending cleanup remain in place. Downgrades are refused because older binaries may not understand the current journal. Updates replace the executable you invoke; use the installed service's path when upgrading a host service. A running daemon continues using its old executable until restarted; `--restart` requests the native OS service restart. Without that flag, the updater leaves service control to you.
+
+Versions before v0.5.0 need one initial upgrade through the existing installer or release archive before `custos update` is available. Container deployments should rebuild or pull their image rather than self-update a container layer. Release archives remain available alongside the updater executables and `SHA256SUMS`.
+
+Short flags include `-c` for configuration, `-u` for API URL, `-l` for log path, `-f` for log format, `-m` for mock analysis, and `-a` for all crawlers. `custos update -n` checks availability; `-t VERSION` selects a release. Long flags remain supported.
 
 Custos now identifies ten crawler/fetcher services using their publishers' IP lists: Google common crawlers, Google special crawlers, Google-controlled fetchers, Bingbot, Applebot, GPTBot, OAI-SearchBot, ChatGPT-User, OAI-AdsBot, and Nokia Deepfield Genome. Network ownership, country, and a claimed User-Agent do not grant a crawler exception. Each service lists its official feed, documentation, freshness, category, and configured policy.
 
@@ -59,6 +74,10 @@ Custos now identifies ten crawler/fetcher services using their publishers' IP li
 custos crawlers list
 custos crawlers identify 216.180.246.202
 sudo custos --config /etc/custos/config.toml crawlers block nokia_genome
+sudo custos -c /etc/custos/config.toml crawlers block gptbot nokia_genome
+sudo custos -c /etc/custos/config.toml crawlers block all
+# Equivalent: crawlers block --all (or -a)
+sudo custos -c /etc/custos/config.toml crawlers unblock --all
 sudo custos --config /etc/custos/config.toml crawlers allow nokia_genome
 # "unblock" is an alias for "allow"; "normal" restores ordinary analysis.
 sudo custos --config /etc/custos/config.toml crawlers normal nokia_genome
@@ -71,6 +90,8 @@ Administrative commands require `daemon.api_token` or `CUSTOS_API_TOKEN` in the 
 
 All services default to `normal`. `block` rejects verified matching addresses immediately at the HTTP checker and records kernel IP bans when their log events arrive. `allow` permits ordinary crawling and removes local policy/scanner/enumeration bans; it retains manual, community, cached-exploit, and corroborated exploit bans. Rate limits and protected request signatures still apply. Decisions explain service identity, evidence, and the policy action separately.
 
+`block`, `allow`/`unblock`, and `normal` accept one or more IDs, `all`, or `--all`. The whole selection is validated before a single durable policy commit, so an invalid ID cannot partially change the selection. Authenticated `PUT /v1/crawlers` accepts `{"policy":"block","ids":["gptbot","nokia_genome"]}` or `{"policy":"block","all":true}`. The individual-ID endpoint remains supported.
+
 The daemon refreshes publisher feeds off the request path at startup and every 24 hours. Embedded integrations can schedule `pipeline.crawlers.refresh()` themselves. Verification expires after seven days without a successful refresh; stale/unrecognized addresses receive normal analysis rather than a trust exception. The compiled snapshot permits offline startup. Saved runtime policies override TOML defaults and survive restart in a private sibling file, such as `/var/lib/custos/decisions.crawlers.json`; `crawlers.state_file` can choose another path. Feed bytes, prefix counts, policy names, source-health entries, and stored evidence have fixed admission limits. Overlapping service ranges use the stricter policy.
 
 Public `/v1/decisions` retains legacy score fields and adds `maliciousness_score` and `threat_class_confidence` for local Jev decisions. Detailed redacted evidence is available only through authenticated `GET /v1/decisions/{ip}/evidence`. Authenticated `PUT /v1/crawlers/{id}` accepts `{"policy":"block"}` (or `allow` / `normal`); `GET /v1/crawlers`, `GET /v1/crawlers/identify?ip=...`, and authenticated `POST /v1/crawlers/refresh` expose the catalog. If cleanup fails, the policy remains saved, the API reports a conflict, and the durable cleanup obligation remains for retry.
@@ -79,7 +100,7 @@ Public `/v1/decisions` retains legacy score fields and adds `maliciousness_score
 
 On Linux nftables, enable `firewall.protect_docker = true` to install IPv4 and IPv6 source-ban rules on both the input and forward hooks. Custos restores its chains and active bans on restart without flushing other firewall tables. This replaces the manual Docker forwarding workaround. If previously installed, remove only its Custos-specific systemd drop-in after enabling this setting; never flush the Docker host's full ruleset. Other firewall backends reject this option explicitly.
 
-Validation: 171 Rust tests pass, including 16 crawler regressions and an isolated 220,000-event saturation profile that checks normal admission, bounded memory, active bans, and pending kernel cleanup. Live Docker checks cover native Traefik ForwardAuth, Nginx throttling, IPv4/IPv6 forwarding drops, restart recovery, and unbanning. Both nftables and ipset clean 256 expired bans in two batch removals while all 25 normal checks remain allowed. CLI controls and all ten official feed refreshes were also verified locally.
+Validation: 180 Rust tests pass, including crawler regressions and an isolated 220,000-event saturation profile that checks normal admission, bounded memory, active bans, and pending kernel cleanup. Live Docker checks cover native Traefik ForwardAuth, Nginx throttling, IPv4/IPv6 forwarding drops, restart recovery, and unbanning. Both nftables and ipset clean 256 expired bans in two batch removals while all 25 normal checks remain allowed. Update regressions replace a disposable executable, preserve adjacent state, and reject corrupted downloads, wrong candidate versions, missing digests, oversized assets, and unpublished releases. CLI controls and all ten official feed refreshes were also verified locally.
 
 ## v0.4.1: Native Traefik / Dokploy JSON access logs
 
@@ -251,7 +272,7 @@ curl -fsSL https://raw.githubusercontent.com/george-amir/Custos/main/install.sh 
 
 #### Or Install Directly via Cargo (No `protoc` Required)
 ```bash
-cargo install --git https://github.com/george-amir/Custos.git --tag v0.4.1 --locked
+cargo install --git https://github.com/george-amir/Custos.git --tag v0.5.0 --locked
 ```
 
 ### 2. Zero-Config Setup & Run (`custos init`)
@@ -594,7 +615,7 @@ Because `custos` vendors its generated Protobuf/gRPC code in [`src/hub_proto.rs`
 ### Add to `Cargo.toml`
 ```toml
 [dependencies]
-custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.4.1" }
+custos = { git = "https://github.com/george-amir/Custos.git", tag = "v0.5.0" }
 ```
 
 ### Embed `custos_bouncer_middleware` in an Axum Router

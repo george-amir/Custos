@@ -164,6 +164,7 @@ pub fn build_bouncer_router(state: AppState) -> Router {
     // An empty admin token disables these routes; unauthenticated requests cannot
     // persist policies, refresh trust data, or revoke bans.
     let crawler_mutations = Router::new()
+        .route("/v1/crawlers", axum::routing::put(handle_crawler_policies))
         .route(
             "/v1/crawlers/{id}",
             axum::routing::put(handle_crawler_policy),
@@ -556,6 +557,46 @@ async fn handle_identify_crawler(
 #[derive(Deserialize)]
 struct CrawlerPolicyRequest {
     policy: crate::crawlers::CrawlerPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrawlerPoliciesRequest {
+    policy: crate::crawlers::CrawlerPolicy,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+async fn handle_crawler_policies(
+    State(state): State<AppState>,
+    Json(mut request): Json<CrawlerPoliciesRequest>,
+) -> axum::response::Response {
+    if request.all && !request.ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Select ids or all, not both").into_response();
+    }
+    if request.all {
+        request.ids = crate::crawlers::CATALOG
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+    }
+    if request.ids.is_empty()
+        || request.ids.len() > crate::crawlers::CATALOG.len()
+        || request
+            .ids
+            .iter()
+            .any(|id| !crate::crawlers::CATALOG.iter().any(|c| &c.id == id))
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid crawler selection").into_response();
+    }
+    let pipeline = state.pipeline.clone();
+    match tokio::task::spawn_blocking(move || pipeline.set_crawler_policies(&request.ids, request.policy)).await {
+        Ok(Ok(removed)) => Json(serde_json::json!({"saved":true, "automatic_bans_removed":removed, "cleanup_pending":state.store.sweep_expired().len()})).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 async fn handle_crawler_policy(
     State(state): State<AppState>,
