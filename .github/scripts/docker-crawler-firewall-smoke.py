@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from docker_test_network import create_test_network
 
 
 def docker(*args, check=True, timeout=30, input=None):
@@ -38,7 +39,7 @@ def main():
         try:
             for network, part in ((network_a, "a"), (network_b, "b")):
                 prefix = f"fd42:{suffix[:4]}:{suffix[4:]}:{part}::/64"
-                docker("network", "create", "--ipv6", "--subnet", prefix, network)
+                create_test_network(docker, network, prefix)
             configuration = json.loads(docker("network", "inspect", network_a).stdout)[0]["IPAM"]["Config"]
             subnet = next(ipaddress.ip_network(item["Subnet"]) for item in configuration
                           if ipaddress.ip_network(item["Subnet"]).version == 4)

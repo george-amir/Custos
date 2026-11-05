@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the README's Nginx integration in an isolated Docker network."""
 import datetime
-import ipaddress
 import json
 import os
 import pathlib
@@ -10,10 +9,14 @@ import subprocess
 import tempfile
 import time
 import uuid
+from docker_test_network import create_test_network
 
 
 def docker(*args, check=True):
-    return subprocess.run(["docker", *args], text=True, capture_output=True, check=check)
+    result = subprocess.run(["docker", *args], text=True, capture_output=True)
+    if check and result.returncode:
+        raise RuntimeError(f"docker {args[0]} failed: {result.stderr}")
+    return result
 
 
 def main():
@@ -44,14 +47,12 @@ throttle_secs = 5
 [firewall]
 enabled = false
 ''')
-        docker("network", "create", name)
-        network = json.loads(docker("network", "inspect", name).stdout)[0]
-        subnet = ipaddress.ip_network(network["IPAM"]["Config"][0]["Subnet"])
+        subnet = create_test_network(docker, name)
         proxy_address = str(subnet.network_address + 3)
         config_path = tmp.joinpath("config.toml")
         config_path.write_text(config_path.read_text().replace("[daemon]\n", '[daemon]\ntrusted_proxies = ' + json.dumps([proxy_address]) + '\n') + '\n[crawlers]\nauto_refresh = false\n')
         try:
-            docker("run", "-d", "--name", engine, "--network", name,
+            docker("run", "-d", "--name", engine, "--network", name, "--ip", str(subnet.network_address + 2),
                    "--network-alias", "custos", "-v", f"{directory}:/test:ro",
                    os.environ.get("CUSTOS_TEST_IMAGE", "custos:ci"), "--config", "/test/config.toml", "run", "--mock-jev")
             for _ in range(50):
